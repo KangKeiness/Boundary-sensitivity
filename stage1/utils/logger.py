@@ -3,7 +3,6 @@
 import json
 import os
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -22,9 +21,7 @@ def save_results(
     condition: str,
     results: List[Dict],
 ):
-    """
-    Save inference results as JSONL (without hidden_states, which are saved separately).
-    """
+    """Save inference results as JSONL (hidden_states excluded; saved separately)."""
     path = os.path.join(run_dir, f"results_{condition}.jsonl")
     with open(path, "w") as f:
         for r in results:
@@ -38,10 +35,7 @@ def save_hidden_states(
     results: List[Dict],
 ):
     """Save hidden states as a .pt file keyed by sample_id."""
-    hs_dict = {}
-    for r in results:
-        hs_dict[r["sample_id"]] = r["hidden_states"]
-
+    hs_dict = {r["sample_id"]: r["hidden_states"] for r in results}
     path = os.path.join(run_dir, f"hidden_states_{condition}.pt")
     torch.save(hs_dict, path)
 
@@ -53,16 +47,13 @@ def save_bds_results(
 ):
     """Save BDS analysis results as JSON."""
     path = os.path.join(run_dir, f"bds_{condition}.json")
-
-    # Make serializable
     serializable = {
-        "aggregate": bds_results["aggregate"],
-        "n_samples": bds_results["n_samples"],
-        "b": bds_results["b"],
-        "t": bds_results["t"],
+        "aggregate":  bds_results["aggregate"],
+        "n_samples":  bds_results["n_samples"],
+        "b":          bds_results["b"],
+        "t":          bds_results["t"],
         "per_sample": bds_results["per_sample"],
     }
-
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2, ensure_ascii=False)
 
@@ -83,54 +74,64 @@ def save_manifest(
     conditions: List[str],
     sample_ids: List[str],
     hidden_state_info: Optional[Dict] = None,
+    random_donor_source_start: Optional[int] = None,
 ):
     """
-    Save run manifest with metadata.
+    Save run manifest with full metadata.
 
     Args:
         run_dir: Path to the run directory.
-        config: The Stage1Config object.
+        config: Stage1Config object.
         conditions: List of condition names that were run.
         sample_ids: Ordered list of sample IDs.
         hidden_state_info: Dict with shape, dtype, layer_count info.
+        random_donor_source_start: Actual source layer offset used for random_donor.
     """
     manifest = {
         "timestamp": datetime.now().isoformat(),
         "config": {
             "models": {
                 "recipient": config.models.recipient,
-                "donor": config.models.donor,
+                "donor":     config.models.donor,
             },
             "boundary_grid": config.boundary_grid,
-            "t_fixed": config.t_fixed,
+            "t_fixed":       config.t_fixed,
             "reference": {
                 "b_ref": config.reference.b_ref,
                 "t_ref": config.reference.t_ref,
             },
-            "hidden_state": {
-                "pooling": config.hidden_state.pooling,
-            },
+            "hidden_state": {"pooling": config.hidden_state.pooling},
             "dataset": {
-                "name": config.dataset.name,
-                "lang": config.dataset.lang,
-                "split": config.dataset.split,
+                "name":    config.dataset.name,
+                "lang":    config.dataset.lang,
+                "split":   config.dataset.split,
                 "debug_n": config.dataset.debug_n,
             },
             "generation": {
-                "do_sample": config.generation.do_sample,
-                "temperature": config.generation.temperature,
+                "do_sample":      config.generation.do_sample,
+                "temperature":    config.generation.temperature,
                 "max_new_tokens": config.generation.max_new_tokens,
             },
         },
-        "conditions": conditions,
-        "sample_ordering": sample_ids,
-        "hidden_state_pooling": config.hidden_state.pooling,
+        "conditions":            conditions,
+        "sample_ordering":       sample_ids,
+        "hidden_state_pooling":  config.hidden_state.pooling,
+        # P1-2: clarify reference condition semantics
+        "reference_note": (
+            "Fixed canonical composition (b_ref=8, t_ref=20, a priori). "
+            "Structurally identical to hard-swap but boundary is fixed before sweep "
+            "and not tuned on results. "
+            "Not a full reproduction of Bandarkar-style recipe."
+        ),
+        # P2: random donor reproducibility
+        "random_donor_seed":         config.random_donor.seed,
+        "random_donor_source_start": random_donor_source_start,
     }
 
     if hidden_state_info:
         manifest["hidden_state_layer_count"] = hidden_state_info.get("layer_count")
-        manifest["hidden_state_shape"] = hidden_state_info.get("shape")
-        manifest["hidden_state_dtype"] = hidden_state_info.get("dtype")
+        manifest["hidden_state_shape"]       = hidden_state_info.get("shape")
+        manifest["hidden_state_dtype"]       = hidden_state_info.get("dtype")
 
     path = os.path.join(run_dir, "manifest.json")
     with open(path, "w") as f:

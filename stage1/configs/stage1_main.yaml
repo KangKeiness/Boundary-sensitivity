@@ -14,6 +14,7 @@ hidden_state:
 
 random_donor:
   mode: "same_width_random_source"
+  seed: 42
 
 dataset:
   name: "juletxara/mgsm"

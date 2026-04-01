@@ -2,7 +2,7 @@
 
 import copy
 import random
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -74,7 +74,8 @@ def compose_model(
     b: int,
     t: int,
     condition: str = "hard_swap",
-) -> AutoModelForCausalLM:
+    seed: int = 42,
+) -> Tuple[AutoModelForCausalLM, Dict]:
     """
     Create a composed model via two-cut hard swap.
 
@@ -90,9 +91,11 @@ def compose_model(
         b: Lower boundary (start of donor block).
         t: Upper boundary (end of donor block, exclusive).
         condition: One of "hard_swap", "reference", "random_donor".
+        seed: RNG seed for random_donor reproducibility.
 
     Returns:
-        A new model with the composed layers.
+        (composed_model, metadata) where metadata contains condition-specific
+        information such as source_start for random_donor.
     """
     num_layers = recipient.config.num_hidden_layers
     if b < 0 or t > num_layers or b >= t:
@@ -105,23 +108,36 @@ def compose_model(
     composed_layers = _get_transformer_layers(composed)
     donor_layers = _get_transformer_layers(donor)
 
+    metadata: Dict = {}
+
     if condition == "random_donor":
-        # Same width block but from a random source position in donor
+        # Same-width block, random source position in donor.
+        # Reference condition comment: same hard-swap mechanism as main conditions,
+        # but boundary is fixed a priori (not selected from sweep results).
+        # This is a fixed canonical baseline, not a structurally distinct composition.
         block_width = t - b
         max_start = num_layers - block_width
-        source_start = random.randint(0, max_start)
+        rng = random.Random(seed)
+        source_start = rng.randint(0, max_start)
+        metadata["source_start"] = source_start
+        metadata["seed"] = seed
         for i in range(block_width):
             composed_layers[b + i].load_state_dict(
                 donor_layers[source_start + i].state_dict()
             )
     else:
-        # hard_swap or reference: direct positional swap
+        # hard_swap or reference: direct positional swap b..t-1.
+        #
+        # Reference condition: same hard-swap mechanism as main conditions,
+        # but boundary (b_ref, t_ref) is fixed a priori before any sweep results
+        # are observed. This is a canonical fixed baseline — NOT a structurally
+        # distinct composition and not a reproduction of Bandarkar-style recipes.
         for layer_idx in range(b, t):
             composed_layers[layer_idx].load_state_dict(
                 donor_layers[layer_idx].state_dict()
             )
 
-    return composed
+    return composed, metadata
 
 
 def get_condition_model(
@@ -132,7 +148,8 @@ def get_condition_model(
     t: Optional[int] = None,
     b_ref: Optional[int] = None,
     t_ref: Optional[int] = None,
-) -> AutoModelForCausalLM:
+    random_donor_seed: int = 42,
+) -> Tuple[AutoModelForCausalLM, Dict]:
     """
     Get the appropriate model for a given experimental condition.
 
@@ -140,16 +157,18 @@ def get_condition_model(
         recipient: Recipient (instruct) model.
         donor: Donor (base) model.
         condition: One of "no_swap", "hard_swap", "reference", "random_donor".
-        b: Lower boundary for hard_swap conditions.
-        t: Upper boundary for hard_swap conditions.
+        b: Lower boundary for hard_swap / random_donor.
+        t: Upper boundary for hard_swap / random_donor.
         b_ref: Reference lower boundary (for reference condition).
         t_ref: Reference upper boundary (for reference condition).
+        random_donor_seed: Seed for random_donor source position.
 
     Returns:
-        The model to use for this condition.
+        (model, metadata) — metadata is {} for no_swap / hard_swap / reference,
+        and {"source_start": int, "seed": int} for random_donor.
     """
     if condition == "no_swap":
-        return recipient
+        return recipient, {}
 
     if condition == "hard_swap":
         if b is None or t is None:
@@ -164,6 +183,6 @@ def get_condition_model(
     if condition == "random_donor":
         if b is None or t is None:
             raise ValueError("random_donor requires b and t parameters")
-        return compose_model(recipient, donor, b, t, condition="random_donor")
+        return compose_model(recipient, donor, b, t, condition="random_donor", seed=random_donor_seed)
 
-    raise ValueError(f"Unknown condition: {condition}")
+    raise ValueError(f"Unknown condition: {condition!r}")
