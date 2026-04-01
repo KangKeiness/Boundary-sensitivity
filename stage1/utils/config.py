@@ -30,6 +30,7 @@ class HiddenStateConfig:
 @dataclass
 class RandomDonorConfig:
     mode: str = "same_width_random_source"
+    seed: int = 42
 
 
 @dataclass

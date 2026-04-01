@@ -1,16 +1,48 @@
-"""Evaluation: accuracy metrics, BDS-delta correlation, systematic criteria check."""
+"""Evaluation: accuracy metrics, BDS-delta correlation, systematic criteria checks.
 
-import random as pyrandom
+Key design decisions (paper-grade validity):
+- H1 uses degradation = max(0, baseline - condition), NOT abs(delta)
+- Criterion 1: bootstrapped CI on accuracy delta (vs no-swap) excludes 0
+- Criterion 2: bootstrap distribution of BDS-degradation rank correlation
+               must be >80% positive across resamples
+- Criterion 3: ordering stable between full-set and valid-only accuracy
+"""
+
+import types
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.stats import spearmanr
 
+
+# ─── Basic helpers ────────────────────────────────────────────────────────────
 
 def exact_match(gold: str, predicted: Optional[str]) -> bool:
     """Check if predicted answer exactly matches gold after normalization."""
     if predicted is None:
         return False
     return str(gold).strip() == str(predicted).strip()
+
+
+def get_per_sample_correct(
+    samples: List[Dict],
+    parsed_results: List[Dict],
+) -> List[int]:
+    """
+    Return a list of 0/1 (in samples order) indicating correct/incorrect.
+    Parse failures are treated as incorrect.
+    """
+    parsed_by_id = {r["sample_id"]: r for r in parsed_results}
+    result = []
+    for s in samples:
+        pr = parsed_by_id.get(s["sample_id"])
+        if pr is None or not pr.get("parse_success", False):
+            result.append(0)
+        elif exact_match(s["gold_answer"], pr.get("normalized_answer")):
+            result.append(1)
+        else:
+            result.append(0)
+    return result
 
 
 def compute_accuracy(
@@ -20,12 +52,8 @@ def compute_accuracy(
     """
     Compute accuracy metrics for a single condition.
 
-    Args:
-        samples: List of {sample_id, prompt, gold_answer}.
-        parsed_results: List of {sample_id, output_text, parsed_answer, parse_success, normalized_answer}.
-
-    Returns:
-        Dict with accuracy, valid_answer_rate, parse_failure_rate, n_correct, n_total, n_valid, n_parse_fail.
+    Returns dict with: accuracy, valid_accuracy, valid_answer_rate,
+    parse_failure_rate, n_correct, n_total, n_valid, n_parse_fail.
     """
     parsed_by_id = {r["sample_id"]: r for r in parsed_results}
     n_total = len(samples)
@@ -34,16 +62,12 @@ def compute_accuracy(
     n_parse_fail = 0
 
     for s in samples:
-        sid = s["sample_id"]
-        pr = parsed_by_id.get(sid)
-        if pr is None:
-            n_parse_fail += 1
-            continue
-        if not pr["parse_success"]:
+        pr = parsed_by_id.get(s["sample_id"])
+        if pr is None or not pr.get("parse_success", False):
             n_parse_fail += 1
             continue
         n_valid += 1
-        if exact_match(s["gold_answer"], pr["normalized_answer"]):
+        if exact_match(s["gold_answer"], pr.get("normalized_answer")):
             n_correct += 1
 
     accuracy = n_correct / n_total if n_total > 0 else 0.0
@@ -65,45 +89,44 @@ def compute_delta_vs_baseline(
     condition_accuracy: float,
     baseline_accuracy: float,
 ) -> float:
-    """Compute accuracy delta vs no-swap baseline."""
+    """Signed accuracy delta (condition - baseline). Negative = degradation."""
     return condition_accuracy - baseline_accuracy
 
 
-def bootstrap_ci(
-    values: List[float],
+# ─── Bootstrap helpers ────────────────────────────────────────────────────────
+
+def bootstrap_accuracy_delta_ci(
+    baseline_correct: List[int],
+    condition_correct: List[int],
     n_bootstrap: int = 1000,
     ci: float = 0.95,
     seed: int = 42,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float]:
     """
-    Bootstrap confidence interval for the mean.
+    Bootstrap CI on accuracy delta: mean(condition) - mean(baseline).
+
+    Resamples at the per-sample level, giving a CI that reflects both
+    accuracy difference AND sample-level uncertainty.
 
     Returns:
-        (mean, ci_lower, ci_upper)
+        (ci_lower, ci_upper)
     """
+    n = len(baseline_correct)
+    bc = np.array(baseline_correct, dtype=float)
+    cc = np.array(condition_correct, dtype=float)
     rng = np.random.RandomState(seed)
-    arr = np.array(values)
-    n = len(arr)
-    means = []
+
+    deltas = []
     for _ in range(n_bootstrap):
-        sample = arr[rng.randint(0, n, size=n)]
-        means.append(sample.mean())
-    means = np.sort(means)
+        idx = rng.randint(0, n, size=n)
+        deltas.append(cc[idx].mean() - bc[idx].mean())
+
+    deltas = np.sort(deltas)
     alpha = (1 - ci) / 2
-    lower = np.percentile(means, alpha * 100)
-    upper = np.percentile(means, (1 - alpha) * 100)
-    return float(arr.mean()), float(lower), float(upper)
-
-
-def rank_correlation(x: List[float], y: List[float]) -> float:
-    """Spearman rank correlation between two lists."""
-    n = len(x)
-    if n < 2:
-        return 0.0
-    rank_x = _rank(x)
-    rank_y = _rank(y)
-    d_sq = sum((rx - ry) ** 2 for rx, ry in zip(rank_x, rank_y))
-    return 1 - (6 * d_sq) / (n * (n ** 2 - 1))
+    return (
+        float(np.percentile(deltas, alpha * 100)),
+        float(np.percentile(deltas, (1 - alpha) * 100)),
+    )
 
 
 def _rank(values: List[float]) -> List[float]:
@@ -115,12 +138,78 @@ def _rank(values: List[float]) -> List[float]:
         j = i
         while j < len(indexed) and indexed[j][1] == indexed[i][1]:
             j += 1
-        avg_rank = (i + j + 1) / 2  # 1-based average
+        avg_rank = (i + j + 1) / 2
         for k in range(i, j):
             ranks[indexed[k][0]] = avg_rank
         i = j
     return ranks
 
+
+def rank_correlation(x: List[float], y: List[float]) -> float:
+    """Spearman rank correlation between two equal-length lists."""
+    n = len(x)
+    if n < 2:
+        return 0.0
+    rank_x = _rank(x)
+    rank_y = _rank(y)
+    d_sq = sum((rx - ry) ** 2 for rx, ry in zip(rank_x, rank_y))
+    return 1 - (6 * d_sq) / (n * (n ** 2 - 1))
+
+
+def bootstrap_bds_degradation_correlation(
+    boundary_grid: List[int],
+    baseline_correct: List[int],
+    per_cond_correct: Dict[str, List[int]],
+    per_cond_bds: Dict[str, List[float]],
+    n_bootstrap: int = 1000,
+    positive_threshold: float = 0.8,
+    seed: int = 42,
+) -> Tuple[bool, float, float]:
+    """
+    Bootstrap over samples, recompute BDS-degradation rank correlation each time.
+
+    For each resample:
+    - Compute degradation per boundary = max(0, resampled_baseline_acc - resampled_cond_acc)
+    - Compute mean BDS per boundary = mean of per-sample BDS on resampled indices
+    - Compute rank correlation across boundaries
+
+    Returns:
+        (passes_threshold, positive_rate, mean_rho)
+    """
+    n = len(baseline_correct)
+    bc = np.array(baseline_correct, dtype=float)
+    rng = np.random.RandomState(seed)
+
+    correlations = []
+    for _ in range(n_bootstrap):
+        idx = rng.randint(0, n, size=n)
+
+        boot_deg = []
+        boot_bds = []
+        for b in boundary_grid:
+            cond = f"hard_swap_b{b}"
+            if cond not in per_cond_correct or cond not in per_cond_bds:
+                continue
+            cc = np.array(per_cond_correct[cond], dtype=float)
+            bds_arr = np.array(per_cond_bds[cond], dtype=float)
+
+            # Degradation: non-negative; positive means the swap hurt accuracy
+            deg = max(0.0, bc[idx].mean() - cc[idx].mean())
+            mean_bds = bds_arr[idx].mean()
+
+            boot_deg.append(deg)
+            boot_bds.append(mean_bds)
+
+        if len(boot_deg) >= 2:
+            rho = rank_correlation(boot_bds, boot_deg)
+            correlations.append(rho)
+
+    positive_rate = float(np.mean([c > 0 for c in correlations])) if correlations else 0.0
+    mean_rho = float(np.mean(correlations)) if correlations else 0.0
+    return positive_rate > positive_threshold, positive_rate, mean_rho
+
+
+# ─── Main evaluation ──────────────────────────────────────────────────────────
 
 def evaluate_experiment(
     samples: List[Dict],
@@ -137,62 +226,161 @@ def evaluate_experiment(
         condition_results: {condition_name: list of parsed results}.
         bds_results: {condition_name: BDS results dict}.
         boundary_grid: List of boundary values tested.
-        config: Evaluation config dict.
+        config: Dict with keys bootstrap_n, bootstrap_ci, criteria_threshold.
 
     Returns:
         Comprehensive evaluation results dict.
     """
     bootstrap_n = config.get("bootstrap_n", 1000)
     bootstrap_ci_level = config.get("bootstrap_ci", 0.95)
+    criteria_threshold = config.get("criteria_threshold", 2)
 
-    # Compute per-condition accuracy
+    # ── Per-condition accuracy ─────────────────────────────────────────────
     accuracies = {}
+    per_sample_correct = {}
     for cond, results in condition_results.items():
         accuracies[cond] = compute_accuracy(samples, results)
+        per_sample_correct[cond] = get_per_sample_correct(samples, results)
 
     baseline_acc = accuracies.get("no_swap", {}).get("accuracy", 0.0)
+    baseline_correct = per_sample_correct.get("no_swap", [0] * len(samples))
 
-    # Compute deltas
+    # ── Signed deltas (condition - baseline) ──────────────────────────────
     deltas = {}
     for cond, acc in accuracies.items():
         deltas[cond] = compute_delta_vs_baseline(acc["accuracy"], baseline_acc)
 
-    # BDS-delta rank correlation
-    boundary_deltas = []
+    # ── H1: BDS-degradation rank correlation (P0-2: use degradation, not abs) ──
+    boundary_degradations = []
     boundary_bds_totals = []
     for b in boundary_grid:
         cond = f"hard_swap_b{b}"
-        if cond in deltas and cond in bds_results:
-            boundary_deltas.append(abs(deltas[cond]))
+        if cond in accuracies and cond in bds_results:
+            # Degradation = max(0, baseline - condition). Excludes improvements.
+            degradation = max(0.0, baseline_acc - accuracies[cond]["accuracy"])
+            boundary_degradations.append(degradation)
             boundary_bds_totals.append(bds_results[cond]["aggregate"]["mean_bds_total"])
 
-    bds_delta_corr = rank_correlation(boundary_bds_totals, boundary_deltas) if len(boundary_deltas) >= 2 else None
+    print(f"H1 degradation values: {[round(d, 4) for d in boundary_degradations]}")
 
-    # Bootstrap CI on BDS-delta correlation
-    bds_delta_bootstrap = None
-    if bds_results:
-        per_sample_bds = {}
-        for b in boundary_grid:
-            cond = f"hard_swap_b{b}"
-            if cond in bds_results:
-                per_sample_bds[cond] = [
-                    s["bds_total"] for s in bds_results[cond]["per_sample"]
-                ]
+    bds_delta_rho = None
+    bds_delta_p = None
+    if len(boundary_bds_totals) >= 2:
+        bds_delta_rho, bds_delta_p = spearmanr(boundary_bds_totals, boundary_degradations)
+        bds_delta_rho = float(bds_delta_rho)
+        bds_delta_p = float(bds_delta_p)
 
-        if per_sample_bds:
-            # Bootstrap CI on mean BDS total for each condition
-            bds_delta_bootstrap = {}
-            for cond, values in per_sample_bds.items():
-                mean, ci_lo, ci_hi = bootstrap_ci(
-                    values, n_bootstrap=bootstrap_n, ci=bootstrap_ci_level
-                )
-                bds_delta_bootstrap[cond] = {
-                    "mean": mean,
-                    "ci_lower": ci_lo,
-                    "ci_upper": ci_hi,
-                }
+    # ── Per-condition per-sample BDS (aligned with samples ordering) ──────
+    sample_ids = [s["sample_id"] for s in samples]
+    per_cond_bds_per_sample: Dict[str, List[float]] = {}
+    for b in boundary_grid:
+        cond = f"hard_swap_b{b}"
+        if cond in bds_results:
+            bds_by_id = {r["sample_id"]: r["bds_total"] for r in bds_results[cond]["per_sample"]}
+            per_cond_bds_per_sample[cond] = [bds_by_id.get(sid, 0.0) for sid in sample_ids]
 
-    # Boundary delta table
+    # ── Criterion 1: bootstrapped delta CI excludes 0 for ≥1 boundary ────
+    delta_cis: Dict[str, Tuple[float, float]] = {}
+    for b in boundary_grid:
+        cond = f"hard_swap_b{b}"
+        if cond in per_sample_correct:
+            ci_lo, ci_hi = bootstrap_accuracy_delta_ci(
+                baseline_correct,
+                per_sample_correct[cond],
+                n_bootstrap=bootstrap_n,
+                ci=bootstrap_ci_level,
+                seed=42,
+            )
+            delta_cis[cond] = (ci_lo, ci_hi)
+
+    print(f"Criterion 1: delta CI for each boundary: { {c: [round(v,4) for v in ci] for c,ci in delta_cis.items()} }")
+
+    c1 = any(
+        ci_lo > 0 or ci_hi < 0
+        for (ci_lo, ci_hi) in delta_cis.values()
+    )
+
+    # ── Criterion 2: bootstrap BDS-degradation rank correlation ───────────
+    c2_passes, c2_positive_rate, c2_mean_rho = bootstrap_bds_degradation_correlation(
+        boundary_grid=boundary_grid,
+        baseline_correct=baseline_correct,
+        per_cond_correct=per_sample_correct,
+        per_cond_bds=per_cond_bds_per_sample,
+        n_bootstrap=bootstrap_n,
+        positive_threshold=0.8,
+        seed=42,
+    )
+    print(f"Criterion 2: positive rate = {c2_positive_rate:.3f}")
+
+    # ── Criterion 3: ordering consistent between full and valid-only ──────
+    full_ordering = sorted(
+        boundary_grid,
+        key=lambda b: accuracies.get(f"hard_swap_b{b}", {}).get("accuracy", 0.0),
+    )
+    valid_ordering = sorted(
+        boundary_grid,
+        key=lambda b: accuracies.get(f"hard_swap_b{b}", {}).get("valid_accuracy", 0.0),
+    )
+    c3 = full_ordering == valid_ordering
+
+    n_criteria_met = sum([c1, c2_passes, c3])
+    passed = n_criteria_met >= criteria_threshold
+
+    criteria = {
+        "criterion_1_delta_ci_excludes_zero": c1,
+        "criterion_2_bootstrap_positive": c2_passes,
+        "criterion_2_positive_rate": c2_positive_rate,
+        "criterion_2_mean_rho": c2_mean_rho,
+        "criterion_3_ordering_consistent": c3,
+        "n_criteria_met": n_criteria_met,
+        "threshold": criteria_threshold,
+        "passed": passed,
+    }
+
+    # ── Bootstrap CI on BDS total per condition (saved for reference) ────
+    bds_bootstrap_ci: Dict[str, Dict] = {}
+    for cond, bds_vals in per_cond_bds_per_sample.items():
+        arr = np.array(bds_vals)
+        rng = np.random.RandomState(42)
+        n = len(arr)
+        boot_means = [arr[rng.randint(0, n, size=n)].mean() for _ in range(bootstrap_n)]
+        alpha = (1 - bootstrap_ci_level) / 2
+        bds_bootstrap_ci[cond] = {
+            "mean": float(arr.mean()),
+            "ci_lower": float(np.percentile(boot_means, alpha * 100)),
+            "ci_upper": float(np.percentile(boot_means, (1 - alpha) * 100)),
+        }
+
+    # ── Bootstrap CI on global BDS-delta correlation ──────────────────────
+    bds_delta_ci = None
+    if len(boundary_bds_totals) >= 2 and per_cond_bds_per_sample:
+        rng2 = np.random.RandomState(42)
+        n = len(samples)
+        bc_arr = np.array(baseline_correct, dtype=float)
+        boot_rhos = []
+        for _ in range(bootstrap_n):
+            idx = rng2.randint(0, n, size=n)
+            boot_bds_agg = []
+            boot_deg_agg = []
+            for b in boundary_grid:
+                cond = f"hard_swap_b{b}"
+                if cond not in per_cond_bds_per_sample or cond not in per_sample_correct:
+                    continue
+                bds_arr = np.array(per_cond_bds_per_sample[cond])
+                cc = np.array(per_sample_correct[cond], dtype=float)
+                boot_bds_agg.append(bds_arr[idx].mean())
+                boot_deg_agg.append(max(0.0, bc_arr[idx].mean() - cc[idx].mean()))
+            if len(boot_bds_agg) >= 2:
+                rho, _ = spearmanr(boot_bds_agg, boot_deg_agg)
+                if not np.isnan(rho):
+                    boot_rhos.append(float(rho))
+        if boot_rhos:
+            bds_delta_ci = [
+                float(np.percentile(boot_rhos, 2.5)),
+                float(np.percentile(boot_rhos, 97.5)),
+            ]
+
+    # ── Boundary table ────────────────────────────────────────────────────
     boundary_table = []
     for b in boundary_grid:
         cond = f"hard_swap_b{b}"
@@ -202,78 +390,75 @@ def evaluate_experiment(
             "accuracy": accuracies.get(cond, {}).get("accuracy"),
             "valid_accuracy": accuracies.get(cond, {}).get("valid_accuracy"),
             "delta_vs_baseline": deltas.get(cond),
+            "degradation": max(0.0, baseline_acc - (accuracies.get(cond, {}).get("accuracy") or 0.0)),
         }
+        if cond in delta_cis:
+            row["delta_ci_lower"], row["delta_ci_upper"] = delta_cis[cond]
         if cond in bds_results:
             row["bds_lower"] = bds_results[cond]["aggregate"]["mean_bds_lower"]
             row["bds_upper"] = bds_results[cond]["aggregate"]["mean_bds_upper"]
             row["bds_total"] = bds_results[cond]["aggregate"]["mean_bds_total"]
         boundary_table.append(row)
 
-    # Ordering consistency: full-set vs valid-only accuracy ordering
-    full_ordering = sorted(boundary_grid, key=lambda b: accuracies.get(f"hard_swap_b{b}", {}).get("accuracy", 0.0))
-    valid_ordering = sorted(boundary_grid, key=lambda b: accuracies.get(f"hard_swap_b{b}", {}).get("valid_accuracy", 0.0))
-    ordering_consistent = full_ordering == valid_ordering
-
-    # Systematic criteria check (2/3)
-    criteria = _check_criteria(
-        bds_delta_bootstrap=bds_delta_bootstrap,
-        bds_delta_corr=bds_delta_corr,
-        ordering_consistent=ordering_consistent,
-        threshold=config.get("criteria_threshold", 2),
-    )
-
     return {
         "accuracies": accuracies,
         "deltas": deltas,
         "baseline_accuracy": baseline_acc,
-        "bds_delta_rank_correlation": bds_delta_corr,
-        "bds_bootstrap_ci": bds_delta_bootstrap,
+        "bds_delta_rho": bds_delta_rho,
+        "bds_delta_p": bds_delta_p,
+        "bds_delta_ci": bds_delta_ci,
+        "bds_bootstrap_ci": bds_bootstrap_ci,
+        "delta_cis": {c: list(ci) for c, ci in delta_cis.items()},
         "boundary_table": boundary_table,
-        "ordering_consistent": ordering_consistent,
+        "ordering_consistent": c3,
         "criteria": criteria,
+        # Convenience top-level fields for notebook
+        "criterion_1": c1,
+        "criterion_2": c2_passes,
+        "criterion_2_rate": c2_positive_rate,
+        "criterion_3": c3,
     }
 
 
-def _check_criteria(
-    bds_delta_bootstrap: Optional[Dict],
-    bds_delta_corr: Optional[float],
-    ordering_consistent: bool,
-    threshold: int = 2,
-) -> Dict:
+def evaluate_all(
+    no_swap: List[Dict],
+    sweep: Dict[str, List[Dict]],
+    reference: List[Dict],
+    control: List[Dict],
+    bds: Dict[str, Dict],
+    config,
+    samples: List[Dict] = None,
+) -> types.SimpleNamespace:
     """
-    Check the 3 systematic criteria (need 2/3 to pass).
+    Public API for notebook use. Calls evaluate_experiment and returns a
+    SimpleNamespace for attribute-style access.
 
-    1. At least one boundary has BDS delta with bootstrap CI excluding 0
-    2. Boundary rank correlation is consistently positive
-    3. Ordering stable between full-set and valid-only accuracy
+    Args:
+        no_swap: Parsed results for the no_swap condition.
+        sweep: {condition_name: parsed_results} for hard_swap_b* conditions.
+        reference: Parsed results for reference condition.
+        control: Parsed results for random_donor condition.
+        bds: BDS results dict keyed by condition name.
+        config: Stage1Config object.
+        samples: Original dataset samples (required for per-sample correctness).
+
+    Returns:
+        SimpleNamespace with all evaluation fields accessible as attributes.
     """
-    criteria_met = []
+    all_conditions = {"no_swap": no_swap, **sweep, "reference": reference, "random_donor": control}
 
-    # Criterion 1: at least one boundary CI excludes 0
-    c1 = False
-    if bds_delta_bootstrap:
-        for cond, ci_info in bds_delta_bootstrap.items():
-            if ci_info["ci_lower"] > 0 or ci_info["ci_upper"] < 0:
-                c1 = True
-                break
-    criteria_met.append(c1)
-
-    # Criterion 2: rank correlation consistently positive
-    c2 = bds_delta_corr is not None and bds_delta_corr > 0
-    criteria_met.append(c2)
-
-    # Criterion 3: ordering consistency
-    c3 = ordering_consistent
-    criteria_met.append(c3)
-
-    n_met = sum(criteria_met)
-    passed = n_met >= threshold
-
-    return {
-        "criterion_1_ci_excludes_zero": c1,
-        "criterion_2_positive_correlation": c2,
-        "criterion_3_ordering_consistent": c3,
-        "n_criteria_met": n_met,
-        "threshold": threshold,
-        "passed": passed,
+    eval_config = {
+        "bootstrap_n": config.evaluation.bootstrap_n,
+        "bootstrap_ci": config.evaluation.bootstrap_ci,
+        "criteria_threshold": config.evaluation.criteria_threshold,
     }
+
+    result = evaluate_experiment(
+        samples=samples,
+        condition_results=all_conditions,
+        bds_results=bds,
+        boundary_grid=config.boundary_grid,
+        config=eval_config,
+    )
+
+    return types.SimpleNamespace(**result)

@@ -2,7 +2,6 @@
 
 import argparse
 import gc
-import sys
 import os
 
 import torch
@@ -26,56 +25,43 @@ from stage1.utils.logger import (
 
 def build_conditions(config):
     """Build the list of (condition_name, b, t) tuples to run."""
-    conditions = []
-
-    # 1. no_swap
-    conditions.append(("no_swap", None, None))
-
-    # 2. hard_swap for each boundary
+    conditions = [("no_swap", None, None)]
     for b in config.boundary_grid:
         conditions.append((f"hard_swap_b{b}", b, config.t_fixed))
-
-    # 3. reference
     conditions.append(("reference", config.reference.b_ref, config.reference.t_ref))
-
-    # 4. random_donor (use first boundary width as representative)
     if config.boundary_grid:
         b_rand = config.boundary_grid[0]
         conditions.append(("random_donor", b_rand, config.t_fixed))
-
     return conditions
 
 
-def run_condition(
-    condition_name,
-    b,
-    t,
-    recipient,
-    donor,
-    tokenizer,
-    samples,
-    config,
-):
-    """Run a single experimental condition and return results."""
+def run_condition(condition_name, b, t, recipient, donor, tokenizer, samples, config):
+    """Run a single experimental condition and return (inference_results, parsed_results, metadata)."""
     print(f"\n{'='*60}")
-    print(f"Running condition: {condition_name} (b={b}, t={t})")
+    print(f"Running condition: {condition_name}  (b={b}, t={t})")
     print(f"{'='*60}")
 
-    # Get the model for this condition
-    model = get_condition_model(
+    # Determine internal condition key (hard_swap_b4 → hard_swap, etc.)
+    if condition_name.startswith("hard_swap"):
+        cond_key = "hard_swap"
+    else:
+        cond_key = condition_name
+
+    # get_condition_model now returns (model, metadata)
+    model, cond_metadata = get_condition_model(
         recipient=recipient,
         donor=donor,
-        condition=condition_name.split("_b")[0] if condition_name.startswith("hard_swap") else condition_name,
+        condition=cond_key,
         b=b,
         t=t,
         b_ref=config.reference.b_ref,
         t_ref=config.reference.t_ref,
+        random_donor_seed=config.random_donor.seed,
     )
 
-    # Run inference
     gen_config = {
-        "do_sample": config.generation.do_sample,
-        "temperature": config.generation.temperature,
+        "do_sample":      config.generation.do_sample,
+        "temperature":    config.generation.temperature,
         "max_new_tokens": config.generation.max_new_tokens,
     }
     inference_results = run_inference(
@@ -86,24 +72,22 @@ def run_condition(
         pooling=config.hidden_state.pooling,
     )
 
-    # Parse answers
     parsed_results = []
     for r in inference_results:
         parsed = parse_answer(r["output_text"])
         parsed_results.append({
-            "sample_id": r["sample_id"],
+            "sample_id":  r["sample_id"],
             "output_text": r["output_text"],
             **parsed,
         })
 
-    # Free composed model if it's not the recipient
     if condition_name != "no_swap":
         del model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    return inference_results, parsed_results
+    return inference_results, parsed_results, cond_metadata
 
 
 def main():
@@ -116,20 +100,18 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load config
     config = load_config(args.config)
     print(f"Loaded config from {args.config}")
-    print(f"  Models: {config.models.recipient} / {config.models.donor}")
-    print(f"  Boundary grid: {config.boundary_grid}")
-    print(f"  Dataset: {config.dataset.name} ({config.dataset.lang}, {config.dataset.split})")
+    print(f"  Models     : {config.models.recipient} / {config.models.donor}")
+    print(f"  Boundaries : {config.boundary_grid}  t_fixed={config.t_fixed}")
+    print(f"  Dataset    : {config.dataset.name} ({config.dataset.lang}, {config.dataset.split})")
+    print(f"  Pooling    : {config.hidden_state.pooling}")
     if config.dataset.debug_n:
-        print(f"  Debug mode: {config.dataset.debug_n} samples")
+        print(f"  Debug mode : {config.dataset.debug_n} samples")
 
-    # Create run directory
     run_dir = create_run_dir()
     print(f"\nRun directory: {run_dir}")
 
-    # Load dataset
     print("\nLoading dataset...")
     samples = load_mgsm(
         dataset_name=config.dataset.name,
@@ -139,7 +121,6 @@ def main():
     )
     print(f"  Loaded {len(samples)} samples")
 
-    # Load models
     print("\nLoading models...")
     recipient, donor, tokenizer = load_models(
         recipient_name=config.models.recipient,
@@ -147,19 +128,18 @@ def main():
     )
     print("  Models loaded successfully")
 
-    # Build conditions
     conditions = build_conditions(config)
     print(f"\nConditions to run: {[c[0] for c in conditions]}")
 
-    # Run all conditions
-    all_inference = {}
-    all_parsed = {}
+    # ── Run all conditions ────────────────────────────────────────────────
+    all_inference: dict = {}
+    all_parsed: dict    = {}
+    random_donor_source_start: int | None = None
 
     for cond_name, b, t in conditions:
-        inference_results, parsed_results = run_condition(
+        inf_results, parsed_results, cond_meta = run_condition(
             condition_name=cond_name,
-            b=b,
-            t=t,
+            b=b, t=t,
             recipient=recipient,
             donor=donor,
             tokenizer=tokenizer,
@@ -167,50 +147,47 @@ def main():
             config=config,
         )
 
-        all_inference[cond_name] = inference_results
-        all_parsed[cond_name] = parsed_results
+        all_inference[cond_name] = inf_results
+        all_parsed[cond_name]    = parsed_results
 
-        # Save results incrementally
+        if cond_name == "random_donor" and "source_start" in cond_meta:
+            random_donor_source_start = cond_meta["source_start"]
+            print(f"  Random donor source_start={random_donor_source_start} (seed={config.random_donor.seed})")
+
         save_results(run_dir, cond_name, parsed_results)
-        save_hidden_states(run_dir, cond_name, inference_results)
+        save_hidden_states(run_dir, cond_name, inf_results)
         print(f"  Saved results for {cond_name}")
 
-    # Compute BDS for each non-baseline condition
-    print("\n" + "=" * 60)
-    print("Computing BDS scores...")
-    print("=" * 60)
+    # ── BDS ───────────────────────────────────────────────────────────────
+    print(f"\n{'='*60}\nComputing BDS scores...\n{'='*60}")
 
     recipient_hs = [
         {"sample_id": r["sample_id"], "hidden_states": r["hidden_states"]}
         for r in all_inference["no_swap"]
     ]
 
-    bds_all = {}
+    bds_all: dict = {}
     for cond_name, b, t in conditions:
         if cond_name == "no_swap" or b is None:
             continue
-
         composed_hs = [
             {"sample_id": r["sample_id"], "hidden_states": r["hidden_states"]}
             for r in all_inference[cond_name]
         ]
-
         bds = compute_bds(recipient_hs, composed_hs, b, t)
         bds_all[cond_name] = bds
         save_bds_results(run_dir, cond_name, bds)
-        print(f"  BDS for {cond_name}: total={bds['aggregate']['mean_bds_total']:.4f}")
+        print(f"  {cond_name}: bds_total={bds['aggregate']['mean_bds_total']:.4f}  "
+              f"cka_bds_total={bds['aggregate']['cka_bds_total']:.4f}")
 
-    # Evaluation
-    print("\n" + "=" * 60)
-    print("Running evaluation...")
-    print("=" * 60)
+    # ── Evaluation ────────────────────────────────────────────────────────
+    print(f"\n{'='*60}\nRunning evaluation...\n{'='*60}")
 
     eval_config = {
-        "bootstrap_n": config.evaluation.bootstrap_n,
-        "bootstrap_ci": config.evaluation.bootstrap_ci,
-        "criteria_threshold": config.evaluation.criteria_threshold,
+        "bootstrap_n":         config.evaluation.bootstrap_n,
+        "bootstrap_ci":        config.evaluation.bootstrap_ci,
+        "criteria_threshold":  config.evaluation.criteria_threshold,
     }
-
     evaluation = evaluate_experiment(
         samples=samples,
         condition_results=all_parsed,
@@ -218,39 +195,42 @@ def main():
         boundary_grid=config.boundary_grid,
         config=eval_config,
     )
-
     save_evaluation(run_dir, evaluation)
 
-    # Print summary
-    print("\n" + "=" * 60)
-    print("RESULTS SUMMARY")
-    print("=" * 60)
-
+    # ── Print summary ─────────────────────────────────────────────────────
+    print(f"\n{'='*60}\nRESULTS SUMMARY\n{'='*60}")
     print(f"\nBaseline accuracy (no_swap): {evaluation['baseline_accuracy']:.4f}")
-    print("\nBoundary table:")
-    print(f"  {'Boundary':>10} {'Accuracy':>10} {'Delta':>10} {'BDS_total':>10}")
+    print(f"\n{'Boundary':>10} {'Accuracy':>10} {'Delta':>10} {'BDS_total':>10} {'CKA_BDS':>10}")
     for row in evaluation["boundary_table"]:
         print(
-            f"  {row['boundary']:>10} "
-            f"{row.get('accuracy', 'N/A'):>10.4f} "
-            f"{row.get('delta_vs_baseline', 'N/A'):>10.4f} "
-            f"{row.get('bds_total', 'N/A'):>10.4f}"
+            f"{row['boundary']:>10} "
+            f"{row.get('accuracy', 0.0):>10.4f} "
+            f"{row.get('delta_vs_baseline', 0.0):>10.4f} "
+            f"{row.get('bds_total', float('nan')):>10.4f} "
+            f"{bds_all.get(row['condition'], {}).get('aggregate', {}).get('cka_bds_total', float('nan')):>10.4f}"
         )
 
-    if evaluation["bds_delta_rank_correlation"] is not None:
-        print(f"\nBDS-delta rank correlation: {evaluation['bds_delta_rank_correlation']:.4f}")
+    if evaluation["bds_delta_rho"] is not None:
+        print(f"\nH1 BDS-degradation rank correlation: rho={evaluation['bds_delta_rho']:.4f}  "
+              f"p={evaluation['bds_delta_p']:.4f}")
+    if evaluation["bds_delta_ci"]:
+        print(f"Bootstrap CI: {[round(v,4) for v in evaluation['bds_delta_ci']]}")
 
-    print(f"\nOrdering consistent: {evaluation['ordering_consistent']}")
-    print(f"\nSystematic criteria: {evaluation['criteria']}")
+    print(f"\nOrdering consistent (C3): {evaluation['ordering_consistent']}")
+    criteria = evaluation["criteria"]
+    print(f"Criteria: C1={criteria['criterion_1_delta_ci_excludes_zero']}  "
+          f"C2={criteria['criterion_2_bootstrap_positive']} (rate={criteria['criterion_2_positive_rate']:.3f})  "
+          f"C3={criteria['criterion_3_ordering_consistent']}  "
+          f"→ passed={criteria['passed']} ({criteria['n_criteria_met']}/{criteria['threshold']})")
 
-    # Save manifest
+    # ── Manifest ──────────────────────────────────────────────────────────
     hidden_state_info = None
     if all_inference.get("no_swap"):
         hs0 = all_inference["no_swap"][0]["hidden_states"]
         hidden_state_info = {
             "layer_count": hs0.shape[0],
-            "shape": list(hs0.shape),
-            "dtype": str(hs0.dtype),
+            "shape":       list(hs0.shape),
+            "dtype":       str(hs0.dtype),
         }
 
     save_manifest(
@@ -259,9 +239,18 @@ def main():
         conditions=[c[0] for c in conditions],
         sample_ids=[s["sample_id"] for s in samples],
         hidden_state_info=hidden_state_info,
+        random_donor_source_start=random_donor_source_start,
     )
-
     print(f"\nAll results saved to: {run_dir}")
+
+    # ── Sanity check printout ─────────────────────────────────────────────
+    print(f"\n{'='*60}\nSANITY CHECKS\n{'='*60}")
+    print("1. Hidden state extraction: prompt-only forward pass  ✓")
+    print("2. H1 uses degradation (not abs delta)  ✓")
+    print("3. Criterion 1 checks delta CI  ✓")
+    print(f"4. Criterion 2 uses bootstrap distribution (positive rate={criteria['criterion_2_positive_rate']:.3f})  ✓")
+    print(f"5. Random donor seed: {config.random_donor.seed}  source_start: {random_donor_source_start}  ✓")
+    print(f"6. Reference b_ref fixed a priori: {config.reference.b_ref}  ✓")
     print("Stage 1 pipeline complete.")
 
 

@@ -1,4 +1,9 @@
-"""Greedy inference runner with hidden state extraction."""
+"""Greedy inference runner with hidden state extraction.
+
+Hidden states are extracted from a prompt-only forward pass, giving a fixed
+anchor (last token of the prompt) that is identical across all conditions.
+Answer text is then generated in a separate generate() call.
+"""
 
 from typing import List, Dict
 
@@ -6,40 +11,37 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def extract_hidden_states(
-    outputs,
-    input_length: int,
-    pooling: str = "last_token",
+def _extract_prompt_hidden_states(
+    fwd_hidden_states,
+    pooling: str,
 ) -> torch.Tensor:
     """
-    Extract hidden states from model outputs.
+    Extract hidden states from a prompt-only forward pass.
 
     Args:
-        outputs: Model outputs with hidden_states.
-        input_length: Length of the input tokens (to find generated positions).
-        pooling: "last_token" or "mean".
+        fwd_hidden_states: tuple of (n_layers+1,) tensors, each [batch, seq_len, hidden_dim].
+            Index 0 is the embedding layer output; indices 1..n_layers are transformer layers.
+        pooling: "last_token" or "mean". Applied to prompt tokens only.
 
     Returns:
         Tensor of shape [n_layers, hidden_dim].
     """
-    # outputs.hidden_states is a tuple of (n_layers+1,) tensors of shape [batch, seq_len, hidden_dim]
-    # We include all layers (skip the embedding layer at index 0)
-    hidden_states = outputs.hidden_states[1:]  # skip embedding output
-    n_layers = len(hidden_states)
+    # Skip embedding layer (index 0); take transformer layer outputs
+    layer_outputs = fwd_hidden_states[1:]  # (n_layers,) each [batch, seq_len, hidden_dim]
 
     result = []
-    for layer_idx in range(n_layers):
-        hs = hidden_states[layer_idx][0]  # [seq_len, hidden_dim], batch=0
+    for layer_hs in layer_outputs:
+        hs = layer_hs[0]  # [seq_len, hidden_dim], batch dim removed
 
         if pooling == "last_token":
-            # Last token of the full sequence (input + generated)
-            layer_repr = hs[-1]
+            # Fixed anchor: last token of the prompt
+            repr_vec = hs[-1]
         elif pooling == "mean":
-            layer_repr = hs.mean(dim=0)
+            repr_vec = hs.mean(dim=0)
         else:
-            raise ValueError(f"Unknown pooling method: {pooling}")
+            raise ValueError(f"Unknown pooling method: {pooling!r}. Use 'last_token' or 'mean'.")
 
-        result.append(layer_repr)
+        result.append(repr_vec)
 
     return torch.stack(result)  # [n_layers, hidden_dim]
 
@@ -50,10 +52,14 @@ def run_inference(
     samples: List[Dict],
     generation_config: dict,
     pooling: str = "last_token",
-    device: str = None,
+    device=None,
 ) -> List[Dict]:
     """
-    Run greedy inference on samples and extract hidden states.
+    Run greedy inference on samples.
+
+    For each sample:
+    1. Prompt-only forward pass  → hidden states (fixed anchor, independent of generation length)
+    2. generate()                → answer text
 
     Args:
         model: The model to run inference with.
@@ -61,7 +67,7 @@ def run_inference(
         samples: List of dicts with keys: sample_id, prompt, gold_answer.
         generation_config: Dict with generation parameters.
         pooling: Hidden state pooling method ("last_token" or "mean").
-        device: Device to run on (inferred from model if None).
+        device: Device override (inferred from model if None).
 
     Returns:
         List of dicts with keys: sample_id, output_text, hidden_states.
@@ -71,59 +77,52 @@ def run_inference(
         device = next(model.parameters()).device
 
     model.eval()
-    results = []
 
     gen_kwargs = {
         "do_sample": generation_config.get("do_sample", False),
-        "temperature": generation_config.get("temperature", 0.0),
         "max_new_tokens": generation_config.get("max_new_tokens", 256),
-        "output_hidden_states": True,
-        "return_dict_in_generate": True,
     }
-    # When do_sample=False, temperature is irrelevant; avoid HF warning
-    if not gen_kwargs["do_sample"]:
-        gen_kwargs.pop("temperature", None)
+    # Only pass temperature when sampling; avoids HF warning for greedy decoding
+    if gen_kwargs["do_sample"]:
+        gen_kwargs["temperature"] = generation_config.get("temperature", 1.0)
+
+    results = []
 
     with torch.no_grad():
-        for sample in samples:
+        for idx, sample in enumerate(samples):
             input_ids = tokenizer(
                 sample["prompt"],
                 return_tensors="pt",
                 padding=False,
             ).input_ids.to(device)
 
-            input_length = input_ids.shape[1]
+            prompt_len = input_ids.shape[1]
 
-            outputs = model.generate(input_ids, **gen_kwargs)
-
-            # Decode only the generated tokens
-            generated_ids = outputs.sequences[0, input_length:]
-            output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-            # Extract hidden states from the last forward pass
-            # outputs.hidden_states is a tuple of step-wise hidden states
-            # Each step: tuple of (n_layers+1,) tensors of [batch, 1, hidden_dim]
-            # We need hidden states from the final step for the full context
-            # Use the last generation step's hidden states
-            last_step_hidden = outputs.hidden_states[-1]
-
-            # Build a pseudo-output object for extract_hidden_states
-            class _HiddenStatesContainer:
-                def __init__(self, hs):
-                    self.hidden_states = hs
-
-            full_seq_len = outputs.sequences.shape[1]
-            hs_container = _HiddenStatesContainer(last_step_hidden)
-            hidden_states = extract_hidden_states(
-                hs_container,
-                input_length=input_length,
-                pooling=pooling,
+            # ── Pass 1: prompt-only forward for hidden states ──────────────────
+            fwd_outputs = model(
+                input_ids=input_ids,
+                output_hidden_states=True,
             )
+            hidden_states = _extract_prompt_hidden_states(
+                fwd_outputs.hidden_states,
+                pooling=pooling,
+            ).cpu()
+
+            anchor_pos = prompt_len - 1
+            print(
+                f"  [{idx+1}/{len(samples)}] {sample['sample_id']} | "
+                f"hidden state anchor: prompt {pooling}, position {anchor_pos}"
+            )
+
+            # ── Pass 2: generate for answer text ──────────────────────────────
+            gen_outputs = model.generate(input_ids, **gen_kwargs)
+            generated_ids = gen_outputs[0, prompt_len:]
+            output_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
             results.append({
                 "sample_id": sample["sample_id"],
-                "output_text": output_text.strip(),
-                "hidden_states": hidden_states.cpu(),
+                "output_text": output_text,
+                "hidden_states": hidden_states,
             })
 
     return results
