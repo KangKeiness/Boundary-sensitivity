@@ -112,9 +112,8 @@ def compose_model(
 
     if condition == "random_donor":
         # Same-width block, random source position in donor.
-        # Reference condition comment: same hard-swap mechanism as main conditions,
-        # but boundary is fixed a priori (not selected from sweep results).
-        # This is a fixed canonical baseline, not a structurally distinct composition.
+        # The block width matches the main hard-swap condition (t - b).
+        # source_start is randomly sampled but fixed by seed for reproducibility.
         block_width = t - b
         max_start = num_layers - block_width
         rng = random.Random(seed)

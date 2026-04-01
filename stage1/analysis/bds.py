@@ -32,7 +32,6 @@ def linear_cka_matrix(X: torch.Tensor, Y: torch.Tensor) -> float:
     This is the correct aggregate metric; the old per-vector version was
     equivalent to squared centred cosine similarity and is NOT used here.
     """
-    print(f"  True CKA uses sample matrices {list(X.shape)}")
     n = X.shape[0]
     if n < 2:
         return 0.0
@@ -182,9 +181,12 @@ def compute_bds(
     cka_rec_upper  = linear_cka_matrix(torch.stack(h_rec_t1_list),  torch.stack(h_rec_t_list))
     cka_comp_upper = linear_cka_matrix(torch.stack(h_comp_t1_list), torch.stack(h_comp_t_list))
 
-    # CKA-based disruption: decrease in CKA = more disruption (negative = disrupted)
-    cka_bds_lower = cka_comp_lower - cka_rec_lower
-    cka_bds_upper = cka_comp_upper - cka_rec_upper
+    # CKA-based disruption: CKA is a similarity (0–1), so disruption = decrease in CKA.
+    # Convention matches cosine BDS: positive value = disruption at this boundary.
+    #   cka_bds = cka_rec - cka_comp  →  positive when composed is less similar than recipient.
+    # Sanity: both cka_bds_* and mean_bds_* should be positive under genuine disruption.
+    cka_bds_lower = cka_rec_lower - cka_comp_lower
+    cka_bds_upper = cka_rec_upper - cka_comp_upper
     cka_bds_total = cka_bds_lower + cka_bds_upper
 
     # ── Aggregate primary metric ──────────────────────────────────────────
@@ -249,6 +251,5 @@ def compute_bds_sweep(
             t = config.t_fixed
         else:
             continue
-        print(f"  Computing BDS for {cond_name} (b={b}, t={t})")
         results[cond_name] = compute_bds(hidden_no_swap, hs_composed, b, t)
     return results

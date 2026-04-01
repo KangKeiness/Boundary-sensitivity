@@ -162,6 +162,8 @@ def bootstrap_bds_degradation_correlation(
     per_cond_correct: Dict[str, List[int]],
     per_cond_bds: Dict[str, List[float]],
     n_bootstrap: int = 1000,
+    # Pre-registered operational heuristic: >80% of bootstrap iterations must
+    # yield positive BDS-degradation rank correlation for criterion 2 to pass.
     positive_threshold: float = 0.8,
     seed: int = 42,
 ) -> Tuple[bool, float, float]:
@@ -295,9 +297,12 @@ def evaluate_experiment(
 
     print(f"Criterion 1: delta CI for each boundary: { {c: [round(v,4) for v in ci] for c,ci in delta_cis.items()} }")
 
+    # H1 is a degradation hypothesis: CI must be entirely negative (ci_hi < 0),
+    # meaning the swap consistently hurt accuracy. A CI entirely above 0 would
+    # indicate improvement, which is not evidence for H1.
     c1 = any(
-        ci_lo > 0 or ci_hi < 0
-        for (ci_lo, ci_hi) in delta_cis.values()
+        ci_hi < 0
+        for (_, ci_hi) in delta_cis.values()
     )
 
     # ── Criterion 2: bootstrap BDS-degradation rank correlation ───────────
