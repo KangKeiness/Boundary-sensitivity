@@ -1,0 +1,32 @@
+models:
+  recipient: "Qwen/Qwen2.5-1.5B-Instruct"
+  donor: "Qwen/Qwen2.5-1.5B"
+
+boundary_grid: [8]
+t_fixed: 20
+
+reference:
+  b_ref: 8
+  t_ref: 20
+
+hidden_state:
+  pooling: "last_token"
+
+random_donor:
+  mode: "same_width_random_source"
+
+dataset:
+  name: "juletxara/mgsm"
+  lang: "te"
+  split: "test"
+  debug_n: 5
+
+generation:
+  do_sample: false
+  temperature: 0.0
+  max_new_tokens: 256
+
+evaluation:
+  bootstrap_n: 100
+  bootstrap_ci: 0.95
+  criteria_threshold: 2
