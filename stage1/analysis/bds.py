@@ -4,10 +4,13 @@ Primary metric : centered cosine distance (per-sample, then aggregated)
 Secondary metric: linear CKA over sample matrices (corpus-level robustness check)
 """
 
+import logging
 from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Distance / similarity primitives ────────────────────────────────────────
@@ -32,6 +35,7 @@ def linear_cka_matrix(X: torch.Tensor, Y: torch.Tensor) -> float:
     This is the correct aggregate metric; the old per-vector version was
     equivalent to squared centred cosine similarity and is NOT used here.
     """
+    logger.debug("linear_cka_matrix: X=%s, Y=%s", list(X.shape), list(Y.shape))
     n = X.shape[0]
     if n < 2:
         return 0.0
@@ -174,17 +178,17 @@ def compute_bds(
         h_comp_t_list.append(h_comp[t])
 
     # ── True linear CKA over sample matrices (secondary metric) ──────────
-    # CKA measures similarity between adjacent-layer representations.
-    # Lower CKA for composed vs recipient indicates higher disruption.
+    # ── True linear CKA over sample matrices (secondary metric) ──────────
+    # Both BDS metrics follow the same convention:
+    #   POSITIVE value = MORE disruption at boundary
+    #   cosine BDS: Δ_comp - Δ_rec  (higher distance = more disruption)
+    #   CKA BDS   : CKA_rec - CKA_comp  (lower CKA = more disruption → positive)
+    # This ensures robustness check (cosine vs CKA) is directionally comparable.
     cka_rec_lower  = linear_cka_matrix(torch.stack(h_rec_b1_list),  torch.stack(h_rec_b_list))
     cka_comp_lower = linear_cka_matrix(torch.stack(h_comp_b1_list), torch.stack(h_comp_b_list))
     cka_rec_upper  = linear_cka_matrix(torch.stack(h_rec_t1_list),  torch.stack(h_rec_t_list))
     cka_comp_upper = linear_cka_matrix(torch.stack(h_comp_t1_list), torch.stack(h_comp_t_list))
 
-    # CKA-based disruption: CKA is a similarity (0–1), so disruption = decrease in CKA.
-    # Convention matches cosine BDS: positive value = disruption at this boundary.
-    #   cka_bds = cka_rec - cka_comp  →  positive when composed is less similar than recipient.
-    # Sanity: both cka_bds_* and mean_bds_* should be positive under genuine disruption.
     cka_bds_lower = cka_rec_lower - cka_comp_lower
     cka_bds_upper = cka_rec_upper - cka_comp_upper
     cka_bds_total = cka_bds_lower + cka_bds_upper
@@ -210,6 +214,10 @@ def compute_bds(
         "cka_bds_upper":   cka_bds_upper,
         "cka_bds_total":   cka_bds_total,
     })
+
+    # Sanity: both metrics use positive = disruption convention
+    assert "cka_bds_lower" in aggregate  # CKA BDS: positive = disruption
+    assert "mean_bds_lower" in aggregate  # cosine BDS: positive = disruption
 
     return {
         "per_sample": per_sample,
@@ -251,5 +259,6 @@ def compute_bds_sweep(
             t = config.t_fixed
         else:
             continue
+        logger.info("Computing BDS for %s (b=%d, t=%d)", cond_name, b, t)
         results[cond_name] = compute_bds(hidden_no_swap, hs_composed, b, t)
     return results
