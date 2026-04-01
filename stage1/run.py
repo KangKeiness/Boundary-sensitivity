@@ -6,7 +6,7 @@ import os
 
 import torch
 
-from stage1.utils.config import load_config
+from stage1.utils.config import load_config, setup_logging
 from stage1.data.loader import load_mgsm
 from stage1.models.composer import load_models, get_condition_model
 from stage1.inference.runner import run_inference
@@ -99,6 +99,7 @@ def main():
         help="Path to config YAML file",
     )
     args = parser.parse_args()
+    setup_logging()
 
     config = load_config(args.config)
     print(f"Loaded config from {args.config}")

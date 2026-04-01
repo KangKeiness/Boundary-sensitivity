@@ -162,6 +162,8 @@ def bootstrap_bds_degradation_correlation(
     per_cond_correct: Dict[str, List[int]],
     per_cond_bds: Dict[str, List[float]],
     n_bootstrap: int = 1000,
+    # Pre-registered operational heuristic: >80% of bootstrap iterations must
+    # yield positive BDS-degradation rank correlation for criterion 2 to pass.
     positive_threshold: float = 0.8,
     seed: int = 42,
 ) -> Tuple[bool, float, float]:
@@ -172,6 +174,11 @@ def bootstrap_bds_degradation_correlation(
     - Compute degradation per boundary = max(0, resampled_baseline_acc - resampled_cond_acc)
     - Compute mean BDS per boundary = mean of per-sample BDS on resampled indices
     - Compute rank correlation across boundaries
+
+    Note:
+        positive_threshold is a heuristic, not a formal statistical cutoff.
+        Treat the result as an operational stability indicator for Stage 1,
+        not as a formal statistical test.
 
     Returns:
         (passes_threshold, positive_rate, mean_rho)
@@ -293,12 +300,19 @@ def evaluate_experiment(
             )
             delta_cis[cond] = (ci_lo, ci_hi)
 
-    print(f"Criterion 1: delta CI for each boundary: { {c: [round(v,4) for v in ci] for c,ci in delta_cis.items()} }")
-
-    c1 = any(
-        ci_lo > 0 or ci_hi < 0
-        for (ci_lo, ci_hi) in delta_cis.values()
+    print(
+        f"Criterion 1 (degradation CI): "
+        f"{ {c: f'[{ci[0]:.4f}, {ci[1]:.4f}]' for c, ci in delta_cis.items()} }"
     )
+
+    # H1 is a degradation hypothesis: CI must be entirely negative (ci_hi < 0),
+    # meaning the swap consistently hurt accuracy. A CI entirely above 0 would
+    # indicate improvement, which is not evidence for H1.
+    c1 = any(
+        ci_hi < 0
+        for (_, ci_hi) in delta_cis.values()
+    )
+    print(f"  → passes: {c1} (at least one boundary has ci_hi < 0)")
 
     # ── Criterion 2: bootstrap BDS-degradation rank correlation ───────────
     c2_passes, c2_positive_rate, c2_mean_rho = bootstrap_bds_degradation_correlation(

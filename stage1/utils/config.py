@@ -1,9 +1,19 @@
 """Configuration loading and validation for Stage 1 pipeline."""
 
+import logging
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """Configure root logger with a consistent format for the Stage 1 pipeline."""
+    logging.basicConfig(
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        level=level,
+        force=True,
+    )
 
 
 @dataclass
