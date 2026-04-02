@@ -5,6 +5,10 @@ Run this first on RunPod to confirm the environment is ready:
 """
 
 import sys
+import os
+
+# Resolve imports from stage1/
+sys.path.insert(0, os.path.dirname(__file__))
 
 
 def check_imports():
@@ -39,11 +43,12 @@ def check_cuda():
 
 def check_dataset():
     print("Checking MGSM dataset (1 sample)...")
-    from datasets import load_dataset
-    ds = load_dataset("juletxara/mgsm", "te", split="test")
-    sample = ds[0]
-    print(f"  question : {sample['question'][:60]}...")
-    print(f"  answer   : {sample['answer']}")
+    from data.loader import load_mgsm
+    samples = load_mgsm(lang="te", debug_n=1)
+    s = samples[0]
+    print(f"  sample_id    : {s['sample_id']}")
+    print(f"  gold_answer  : {s['gold_answer']}")
+    print(f"  prompt[:80]  : {s['prompt'][:80]}...")
 
 
 def main():
