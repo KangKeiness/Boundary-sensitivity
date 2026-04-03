@@ -27,7 +27,8 @@ from utils.logger import (
 logger = logging.getLogger(__name__)
 
 
-def verify_results(run_dir: str, in_memory_eval: dict, samples, eval_config: dict, boundary_grid):
+def verify_results(run_dir: str, in_memory_eval: dict, in_memory_bds: dict,
+                   samples, eval_config: dict, boundary_grid):
     """
     Reload saved results from disk, re-run evaluate_experiment(), and assert
     key metrics match the in-memory evaluation (within 1e-6).
@@ -104,6 +105,19 @@ def verify_results(run_dir: str, in_memory_eval: dict, samples, eval_config: dic
         mv, fv = mem_c.get(key), fresh_c.get(key)
         if mv != fv:
             divergences.append(f"criteria.{key}: in_memory={mv!r}  reloaded={fv!r}")
+
+    # ── Verify random_donor BDS disk-write consistency ────────────────────
+    for fname in os.listdir(run_dir):
+        if fname.startswith("bds_random_donor_") and fname.endswith(".json"):
+            cond = fname[len("bds_"):-len(".json")]
+            mem_bds = in_memory_bds.get(cond)
+            rel_bds = reloaded_bds.get(cond)
+            if mem_bds is None or rel_bds is None:
+                divergences.append(f"{cond}: missing in_memory or reloaded BDS")
+                continue
+            _check(f"{cond}.aggregate.mean_bds_total",
+                   mem_bds.get("aggregate", {}).get("mean_bds_total"),
+                   rel_bds.get("aggregate", {}).get("mean_bds_total"))
 
     # ── Report and update manifest ────────────────────────────────────────
     verification_status = "failed" if divergences else "passed"
@@ -297,10 +311,31 @@ def main():
     )
     save_evaluation(run_dir, evaluation)
 
+    # ── Manifest ──────────────────────────────────────────────────────────
+    hidden_state_info = None
+    if all_inference.get("no_swap"):
+        hs0 = all_inference["no_swap"][0]["hidden_states"]
+        hidden_state_info = {
+            "layer_count": hs0.shape[0],
+            "shape":       list(hs0.shape),
+            "dtype":       str(hs0.dtype),
+        }
+
+    save_manifest(
+        run_dir=run_dir,
+        config=config,
+        conditions=[c[0] for c in conditions],
+        sample_ids=[s["sample_id"] for s in samples],
+        hidden_state_info=hidden_state_info,
+        random_donor_source_start=random_donor_source_starts,
+    )
+    print(f"\nAll results saved to: {run_dir}")
+
     # ── Self-verification ─────────────────────────────────────────────────
     verify_results(
         run_dir=run_dir,
         in_memory_eval=evaluation,
+        in_memory_bds=bds_all,
         samples=samples,
         eval_config=eval_config,
         boundary_grid=config.boundary_grid,
@@ -332,26 +367,6 @@ def main():
           f"C3={criteria['criterion_3_ordering_consistent']}  "
           f"→ passed={criteria['passed']} ({criteria['n_criteria_met']}/{criteria['threshold']})")
 
-    # ── Manifest ──────────────────────────────────────────────────────────
-    hidden_state_info = None
-    if all_inference.get("no_swap"):
-        hs0 = all_inference["no_swap"][0]["hidden_states"]
-        hidden_state_info = {
-            "layer_count": hs0.shape[0],
-            "shape":       list(hs0.shape),
-            "dtype":       str(hs0.dtype),
-        }
-
-    save_manifest(
-        run_dir=run_dir,
-        config=config,
-        conditions=[c[0] for c in conditions],
-        sample_ids=[s["sample_id"] for s in samples],
-        hidden_state_info=hidden_state_info,
-        random_donor_source_start=random_donor_source_starts,
-    )
-    print(f"\nAll results saved to: {run_dir}")
-
     # ── Sanity check printout ─────────────────────────────────────────────
     print(f"\n{'='*60}\nSANITY CHECKS\n{'='*60}")
     print("1. Hidden state extraction: prompt-only forward pass  ✓")
@@ -359,7 +374,7 @@ def main():
     print("3. Criterion 1 checks delta CI  ✓")
     print(f"4. Criterion 2 uses bootstrap distribution (positive rate={criteria['criterion_2_positive_rate']:.3f})  ✓")
     print(f"5. Random donor seed: {config.random_donor.seed}  source_starts: {random_donor_source_starts}  ✓")
-    print(f"6. Reference b_ref fixed a priori: {config.reference.b_ref}  ✓")
+    print(f"6. Anchor point: hard_swap_b{config.reference.b_ref} (a priori)  ✓")
     print("Stage 1 pipeline complete.")
 
 

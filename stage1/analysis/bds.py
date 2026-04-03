@@ -251,9 +251,6 @@ def compute_bds_sweep(
         if cond_name.startswith("hard_swap_b") or cond_name.startswith("random_donor_b"):
             b = int(cond_name.split("_b")[-1])
             t = config.t_fixed
-        elif cond_name == "reference":
-            b = config.reference.b_ref
-            t = config.reference.t_ref
         else:
             continue
         logger.info("Computing BDS for %s (b=%d, t=%d)", cond_name, b, t)

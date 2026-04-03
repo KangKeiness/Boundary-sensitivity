@@ -446,11 +446,11 @@ def evaluate_experiment(
     }
 
 
+# Legacy API for notebook use — reference is now part of the sweep as hard_swap_b8
 def evaluate_all(
     no_swap: List[Dict],
     sweep: Dict[str, List[Dict]],
-    reference: List[Dict],
-    control: List[Dict],
+    control: Dict[str, List[Dict]],
     bds: Dict[str, Dict],
     config,
     samples: List[Dict] = None,
@@ -462,8 +462,7 @@ def evaluate_all(
     Args:
         no_swap: Parsed results for the no_swap condition.
         sweep: {condition_name: parsed_results} for hard_swap_b* conditions.
-        reference: Parsed results for reference condition.
-        control: Parsed results for random_donor condition.
+        control: {condition_name: parsed_results} for random_donor_b* conditions.
         bds: BDS results dict keyed by condition name.
         config: Stage1Config object.
         samples: Original dataset samples (required for per-sample correctness).
@@ -471,7 +470,7 @@ def evaluate_all(
     Returns:
         SimpleNamespace with all evaluation fields accessible as attributes.
     """
-    all_conditions = {"no_swap": no_swap, **sweep, "reference": reference, "random_donor": control}
+    all_conditions = {"no_swap": no_swap, **sweep, **control}
 
     eval_config = {
         "bootstrap_n": config.evaluation.bootstrap_n,
