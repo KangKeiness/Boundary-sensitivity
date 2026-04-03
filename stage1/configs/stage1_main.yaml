@@ -18,7 +18,7 @@ random_donor:
 
 dataset:
   name: "mgsm"
-  lang: "te"
+  lang: "zh"
   split: "test"
   debug_n: null  # set integer for debug subset
 

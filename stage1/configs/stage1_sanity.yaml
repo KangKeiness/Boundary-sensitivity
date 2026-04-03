@@ -18,9 +18,9 @@ random_donor:
 
 dataset:
   name: "mgsm"
-  lang: "te"
+  lang: "zh"
   split: "test"
-  debug_n: 5
+  debug_n: 20
 
 generation:
   do_sample: false
