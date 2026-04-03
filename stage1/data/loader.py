@@ -53,7 +53,7 @@ def _parse_tsv(path: Path) -> List[Dict]:
                 gold = None
                 for t in reversed(tokens):
                     try:
-                        gold = int(t.replace(",", ""))
+                        gold = int(t.replace(",", "").rstrip("."))
                         break
                     except ValueError:
                         continue
@@ -63,6 +63,9 @@ def _parse_tsv(path: Path) -> List[Dict]:
                     "question": question,
                     "gold_answer": str(gold),
                 })
+    if len(samples) == 0:
+        raise ValueError(f"No valid samples parsed from {path}. Check TSV column format.")
+    logger.info(f"Parsed {len(samples)} samples from {path} (first gold: {samples[0]['gold_answer']})")
     return samples
 
 
