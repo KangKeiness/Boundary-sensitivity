@@ -2,6 +2,8 @@
 
 import argparse
 import gc
+import json
+import logging
 import os
 
 import torch
@@ -21,6 +23,107 @@ from utils.logger import (
     save_evaluation,
     save_manifest,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def verify_results(run_dir: str, in_memory_eval: dict, samples, eval_config: dict, boundary_grid):
+    """
+    Reload saved results from disk, re-run evaluate_experiment(), and assert
+    key metrics match the in-memory evaluation (within 1e-6).
+
+    Catches file I/O corruption, non-deterministic evaluation bugs, and
+    serialization/deserialization errors.
+
+    Writes "self_verification": "passed" | "failed" into manifest.json.
+    """
+    manifest_path = os.path.join(run_dir, "manifest.json")
+
+    # ── Reload results_*.jsonl files ──────────────────────────────────────
+    reloaded_parsed: dict = {}
+    for fname in os.listdir(run_dir):
+        if fname.startswith("results_") and fname.endswith(".jsonl"):
+            cond = fname[len("results_"):-len(".jsonl")]
+            rows = []
+            with open(os.path.join(run_dir, fname)) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        rows.append(json.loads(line))
+            reloaded_parsed[cond] = rows
+
+    # ── Reload bds_*.json files ───────────────────────────────────────────
+    reloaded_bds: dict = {}
+    for fname in os.listdir(run_dir):
+        if fname.startswith("bds_") and fname.endswith(".json"):
+            cond = fname[len("bds_"):-len(".json")]
+            with open(os.path.join(run_dir, fname)) as f:
+                reloaded_bds[cond] = json.load(f)
+
+    # ── Re-run evaluation on reloaded data ────────────────────────────────
+    fresh_eval = evaluate_experiment(
+        samples=samples,
+        condition_results=reloaded_parsed,
+        bds_results=reloaded_bds,
+        boundary_grid=boundary_grid,
+        config=eval_config,
+    )
+
+    # ── Compare key metrics ───────────────────────────────────────────────
+    divergences = []
+
+    def _check(key, a, b):
+        if a is None and b is None:
+            return
+        if a is None or b is None:
+            divergences.append(f"{key}: in_memory={a!r}  reloaded={b!r}")
+            return
+        if abs(float(a) - float(b)) > 1e-6:
+            divergences.append(f"{key}: in_memory={a:.8f}  reloaded={b:.8f}")
+
+    _check("baseline_accuracy",
+           in_memory_eval.get("baseline_accuracy"),
+           fresh_eval.get("baseline_accuracy"))
+
+    for row_mem, row_fresh in zip(
+        in_memory_eval.get("boundary_table", []),
+        fresh_eval.get("boundary_table", []),
+    ):
+        b = row_mem.get("boundary")
+        _check(f"boundary_{b}_accuracy",
+               row_mem.get("accuracy"), row_fresh.get("accuracy"))
+        _check(f"boundary_{b}_bds_total",
+               row_mem.get("bds_total"), row_fresh.get("bds_total"))
+
+    mem_c = in_memory_eval.get("criteria", {})
+    fresh_c = fresh_eval.get("criteria", {})
+    for key in ("criterion_1_delta_ci_excludes_zero",
+                "criterion_2_bootstrap_positive",
+                "criterion_3_ordering_consistent",
+                "passed"):
+        mv, fv = mem_c.get(key), fresh_c.get(key)
+        if mv != fv:
+            divergences.append(f"criteria.{key}: in_memory={mv!r}  reloaded={fv!r}")
+
+    # ── Report and update manifest ────────────────────────────────────────
+    verification_status = "failed" if divergences else "passed"
+
+    if manifest_path and os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        manifest["self_verification"] = verification_status
+        if divergences:
+            manifest["self_verification_divergences"] = divergences
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    if divergences:
+        msg = "SELF-VERIFICATION FAILED — diverging metrics:\n" + "\n".join(f"  {d}" for d in divergences)
+        logger.error(msg)
+        raise AssertionError(msg)
+
+    print("SELF-VERIFICATION PASSED")
+    logger.info("self_verification: passed")
 
 
 def build_conditions(config):
@@ -192,6 +295,15 @@ def main():
         config=eval_config,
     )
     save_evaluation(run_dir, evaluation)
+
+    # ── Self-verification ─────────────────────────────────────────────────
+    verify_results(
+        run_dir=run_dir,
+        in_memory_eval=evaluation,
+        samples=samples,
+        eval_config=eval_config,
+        boundary_grid=config.boundary_grid,
+    )
 
     # ── Print summary ─────────────────────────────────────────────────────
     print(f"\n{'='*60}\nRESULTS SUMMARY\n{'='*60}")
