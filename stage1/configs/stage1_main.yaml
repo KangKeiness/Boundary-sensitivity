@@ -2,7 +2,7 @@ models:
   recipient: "Qwen/Qwen2.5-1.5B-Instruct"
   donor: "Qwen/Qwen2.5-1.5B"
 
-boundary_grid: [4, 8, 12, 16]
+boundary_grid: [4, 6, 8, 10, 12, 14, 16, 18]
 t_fixed: 20
 
 reference:
