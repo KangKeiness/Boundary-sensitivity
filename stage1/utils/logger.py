@@ -117,8 +117,9 @@ def save_manifest(
         "sample_ordering":       sample_ids,
         "hidden_state_pooling":  config.hidden_state.pooling,
         "reference_note": (
-            "Reference point is hard_swap_b8 (b_ref=8, t_ref=20), selected a priori before sweep. "
-            "No separate reference condition is run; hard_swap_b8 serves as the canonical anchor."
+            f"Anchor point is hard_swap_b{config.reference.b_ref} "
+            f"(b_ref={config.reference.b_ref}, t_ref={config.reference.t_ref}), selected a priori before sweep. "
+            "No separate reference condition is run."
         ),
         # P2: random donor reproducibility
         "random_donor_seed":         config.random_donor.seed,

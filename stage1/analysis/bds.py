@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 def cosine_distance(h1: torch.Tensor, h2: torch.Tensor) -> torch.Tensor:
     """Centered cosine distance: 1 - cosine_similarity(h1 - mean, h2 - mean)."""
+    h1 = h1.float()
+    h2 = h2.float()
     h1c = h1 - h1.mean()
     h2c = h2 - h2.mean()
     sim = F.cosine_similarity(h1c.unsqueeze(0), h2c.unsqueeze(0))
@@ -251,9 +253,6 @@ def compute_bds_sweep(
         if cond_name.startswith("hard_swap_b") or cond_name.startswith("random_donor_b"):
             b = int(cond_name.split("_b")[-1])
             t = config.t_fixed
-        elif cond_name == "reference":
-            b = config.reference.b_ref
-            t = config.reference.t_ref
         else:
             continue
         logger.info("Computing BDS for %s (b=%d, t=%d)", cond_name, b, t)

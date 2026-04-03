@@ -155,15 +155,15 @@ def get_condition_model(
     Args:
         recipient: Recipient (instruct) model.
         donor: Donor (base) model.
-        condition: One of "no_swap", "hard_swap", "reference", "random_donor".
+        condition: One of "no_swap", "hard_swap", "random_donor".
         b: Lower boundary for hard_swap / random_donor.
         t: Upper boundary for hard_swap / random_donor.
-        b_ref: Reference lower boundary (for reference condition).
-        t_ref: Reference upper boundary (for reference condition).
+        b_ref: Unused; kept for call-site compatibility.
+        t_ref: Unused; kept for call-site compatibility.
         random_donor_seed: Seed for random_donor source position.
 
     Returns:
-        (model, metadata) — metadata is {} for no_swap / hard_swap / reference,
+        (model, metadata) — metadata is {} for no_swap / hard_swap,
         and {"source_start": int, "seed": int} for random_donor.
     """
     if condition == "no_swap":
@@ -173,11 +173,6 @@ def get_condition_model(
         if b is None or t is None:
             raise ValueError("hard_swap requires b and t parameters")
         return compose_model(recipient, donor, b, t, condition="hard_swap")
-
-    if condition == "reference":
-        if b_ref is None or t_ref is None:
-            raise ValueError("reference requires b_ref and t_ref parameters")
-        return compose_model(recipient, donor, b_ref, t_ref, condition="reference")
 
     if condition == "random_donor":
         if b is None or t is None:
