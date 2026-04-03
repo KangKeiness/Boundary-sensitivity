@@ -6,14 +6,14 @@ import os
 
 import torch
 
-from stage1.utils.config import load_config, setup_logging
-from stage1.data.loader import load_mgsm
-from stage1.models.composer import load_models, get_condition_model
-from stage1.inference.runner import run_inference
-from stage1.inference.parser import parse_answer
-from stage1.analysis.bds import compute_bds
-from stage1.analysis.evaluator import evaluate_experiment
-from stage1.utils.logger import (
+from utils.config import load_config, setup_logging
+from data.loader import load_mgsm
+from models.composer import load_models, get_condition_model
+from inference.runner import run_inference
+from inference.parser import parse_answer
+from analysis.bds import compute_bds
+from analysis.evaluator import evaluate_experiment
+from utils.logger import (
     create_run_dir,
     save_results,
     save_hidden_states,
