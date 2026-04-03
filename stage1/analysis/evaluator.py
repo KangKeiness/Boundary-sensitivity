@@ -208,8 +208,11 @@ def bootstrap_bds_degradation_correlation(
             boot_bds.append(mean_bds)
 
         if len(boot_deg) >= 2:
-            rho = rank_correlation(boot_bds, boot_deg)
-            correlations.append(rho)
+            from scipy.stats import spearmanr as _sp
+            rho_val, _ = _sp(boot_bds, boot_deg)
+            if np.isnan(rho_val):
+                continue  # skip degenerate resamples (e.g. all-zero degradation)
+            correlations.append(float(rho_val))
 
     positive_rate = float(np.mean([c > 0 for c in correlations])) if correlations else 0.0
     mean_rho = float(np.mean(correlations)) if correlations else 0.0
