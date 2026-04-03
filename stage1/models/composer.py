@@ -116,7 +116,7 @@ def compose_model(
         # source_start is randomly sampled but fixed by seed for reproducibility.
         block_width = t - b
         max_start = num_layers - block_width
-        rng = random.Random(seed)
+        rng = random.Random(seed * 1000 + b)
         source_start = rng.randint(0, max_start)
         metadata["source_start"] = source_start
         metadata["seed"] = seed
