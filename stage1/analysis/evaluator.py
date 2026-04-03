@@ -8,11 +8,14 @@ Key design decisions (paper-grade validity):
 - Criterion 3: ordering stable between full-set and valid-only accuracy
 """
 
+import logging
 import types
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.stats import spearmanr
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Basic helpers ────────────────────────────────────────────────────────────
@@ -216,6 +219,11 @@ def bootstrap_bds_degradation_correlation(
 
     positive_rate = float(np.mean([c > 0 for c in correlations])) if correlations else 0.0
     mean_rho = float(np.mean(correlations)) if correlations else 0.0
+    logger.info(
+        f"C2 bootstrap: n_boundaries={len(boundary_grid)}, "
+        f"n_valid_iterations={len(correlations)}/{n_bootstrap}, "
+        f"positive_rate={positive_rate:.3f}, mean_rho={mean_rho:.3f}"
+    )
     return positive_rate > positive_threshold, positive_rate, mean_rho
 
 
@@ -348,6 +356,7 @@ def evaluate_experiment(
         "criterion_2_bootstrap_positive": c2_passes,
         "criterion_2_positive_rate": c2_positive_rate,
         "criterion_2_mean_rho": c2_mean_rho,
+        "criterion_2_n_boundaries": len(boundary_grid),
         "criterion_3_ordering_consistent": c3,
         "n_criteria_met": n_criteria_met,
         "threshold": criteria_threshold,

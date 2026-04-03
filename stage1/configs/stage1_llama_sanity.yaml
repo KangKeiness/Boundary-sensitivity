@@ -1,0 +1,33 @@
+models:
+  recipient: "meta-llama/Llama-3.2-1B-Instruct"
+  donor: "meta-llama/Llama-3.2-1B"
+
+boundary_grid: [2, 4, 6, 8, 10, 12]
+t_fixed: 12
+
+reference:
+  b_ref: 6
+  t_ref: 12
+
+hidden_state:
+  pooling: "last_token"
+
+random_donor:
+  mode: "same_width_random_source"
+  seed: 42
+
+dataset:
+  name: "mgsm"
+  lang: "zh"
+  split: "test"
+  debug_n: 20
+
+generation:
+  do_sample: false
+  temperature: 0.0
+  max_new_tokens: 256
+
+evaluation:
+  bootstrap_n: 100
+  bootstrap_ci: 0.95
+  criteria_threshold: 2
