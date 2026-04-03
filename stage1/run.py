@@ -131,10 +131,8 @@ def build_conditions(config):
     conditions = [("no_swap", None, None)]
     for b in config.boundary_grid:
         conditions.append((f"hard_swap_b{b}", b, config.t_fixed))
-    conditions.append(("reference", config.reference.b_ref, config.reference.t_ref))
-    if config.boundary_grid:
-        b_rand = config.boundary_grid[0]
-        conditions.append(("random_donor", b_rand, config.t_fixed))
+    for b in config.boundary_grid:
+        conditions.append((f"random_donor_b{b}", b, config.t_fixed))
     return conditions
 
 
@@ -144,9 +142,11 @@ def run_condition(condition_name, b, t, recipient, donor, tokenizer, samples, co
     print(f"Running condition: {condition_name}  (b={b}, t={t})")
     print(f"{'='*60}")
 
-    # Determine internal condition key (hard_swap_b4 → hard_swap, etc.)
+    # Determine internal condition key (hard_swap_b4 → hard_swap, random_donor_b4 → random_donor, etc.)
     if condition_name.startswith("hard_swap"):
         cond_key = "hard_swap"
+    elif condition_name.startswith("random_donor"):
+        cond_key = "random_donor"
     else:
         cond_key = condition_name
 
@@ -233,7 +233,7 @@ def main():
     # ── Run all conditions ────────────────────────────────────────────────
     all_inference: dict = {}
     all_parsed: dict    = {}
-    random_donor_source_start: int | None = None
+    random_donor_source_starts: dict = {}
 
     for cond_name, b, t in conditions:
         inf_results, parsed_results, cond_meta = run_condition(
@@ -249,9 +249,10 @@ def main():
         all_inference[cond_name] = inf_results
         all_parsed[cond_name]    = parsed_results
 
-        if cond_name == "random_donor" and "source_start" in cond_meta:
-            random_donor_source_start = cond_meta["source_start"]
-            print(f"  Random donor source_start={random_donor_source_start} (seed={config.random_donor.seed})")
+        if cond_name.startswith("random_donor_b") and "source_start" in cond_meta:
+            random_donor_source_starts[cond_name] = cond_meta["source_start"]
+            print(f"  Random donor source_start={cond_meta['source_start']} "
+                  f"(cond={cond_name}, seed={config.random_donor.seed})")
 
         save_results(run_dir, cond_name, parsed_results)
         save_hidden_states(run_dir, cond_name, inf_results)
@@ -347,7 +348,7 @@ def main():
         conditions=[c[0] for c in conditions],
         sample_ids=[s["sample_id"] for s in samples],
         hidden_state_info=hidden_state_info,
-        random_donor_source_start=random_donor_source_start,
+        random_donor_source_start=random_donor_source_starts,
     )
     print(f"\nAll results saved to: {run_dir}")
 
@@ -357,7 +358,7 @@ def main():
     print("2. H1 uses degradation (not abs delta)  ✓")
     print("3. Criterion 1 checks delta CI  ✓")
     print(f"4. Criterion 2 uses bootstrap distribution (positive rate={criteria['criterion_2_positive_rate']:.3f})  ✓")
-    print(f"5. Random donor seed: {config.random_donor.seed}  source_start: {random_donor_source_start}  ✓")
+    print(f"5. Random donor seed: {config.random_donor.seed}  source_starts: {random_donor_source_starts}  ✓")
     print(f"6. Reference b_ref fixed a priori: {config.reference.b_ref}  ✓")
     print("Stage 1 pipeline complete.")
 

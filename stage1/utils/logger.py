@@ -74,7 +74,7 @@ def save_manifest(
     conditions: List[str],
     sample_ids: List[str],
     hidden_state_info: Optional[Dict] = None,
-    random_donor_source_start: Optional[int] = None,
+    random_donor_source_start: Optional[Dict[str, int]] = None,
 ):
     """
     Save run manifest with full metadata.
@@ -116,12 +116,9 @@ def save_manifest(
         "conditions":            conditions,
         "sample_ordering":       sample_ids,
         "hidden_state_pooling":  config.hidden_state.pooling,
-        # P1-2: clarify reference condition semantics
         "reference_note": (
-            "Fixed canonical composition (b_ref=8, t_ref=20, a priori). "
-            "Structurally identical to hard-swap but boundary is fixed before sweep "
-            "and not tuned on results. "
-            "Not a full reproduction of Bandarkar-style recipe."
+            "Reference point is hard_swap_b8 (b_ref=8, t_ref=20), selected a priori before sweep. "
+            "No separate reference condition is run; hard_swap_b8 serves as the canonical anchor."
         ),
         # P2: random donor reproducibility
         "random_donor_seed":         config.random_donor.seed,
