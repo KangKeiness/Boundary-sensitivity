@@ -45,7 +45,7 @@ class RandomDonorConfig:
 
 @dataclass
 class DatasetConfig:
-    name: str = "juletxara/mgsm"
+    name: str = "mgsm"
     lang: str = "te"
     split: str = "test"
     debug_n: Optional[int] = None

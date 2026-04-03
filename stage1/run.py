@@ -114,12 +114,7 @@ def main():
     print(f"\nRun directory: {run_dir}")
 
     print("\nLoading dataset...")
-    samples = load_mgsm(
-        dataset_name=config.dataset.name,
-        lang=config.dataset.lang,
-        split=config.dataset.split,
-        debug_n=config.dataset.debug_n,
-    )
+    samples = load_mgsm(config)
     print(f"  Loaded {len(samples)} samples")
 
     print("\nLoading models...")

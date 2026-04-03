@@ -17,7 +17,7 @@ random_donor:
   seed: 42
 
 dataset:
-  name: "juletxara/mgsm"
+  name: "mgsm"
   lang: "te"
   split: "test"
   debug_n: null  # set integer for debug subset
