@@ -43,8 +43,12 @@ def check_cuda():
 
 def check_dataset():
     print("Checking MGSM dataset (1 sample)...")
+    from utils.config import load_config
     from data.loader import load_mgsm
-    samples = load_mgsm(lang="te", debug_n=1)
+    cfg_path = os.path.join(os.path.dirname(__file__), "configs", "stage1_main.yaml")
+    config = load_config(cfg_path)
+    config.dataset.debug_n = 1
+    samples = load_mgsm(config)
     s = samples[0]
     print(f"  sample_id    : {s['sample_id']}")
     print(f"  gold_answer  : {s['gold_answer']}")
