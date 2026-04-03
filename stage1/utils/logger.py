@@ -126,6 +126,12 @@ def save_manifest(
         # P2: random donor reproducibility
         "random_donor_seed":         config.random_donor.seed,
         "random_donor_source_start": random_donor_source_start,
+        "t_fixed_justification": (
+            "t=20 fixes the upper boundary at layer 20 of 28, preserving the top 8 layers as recipient (Instruct). "
+            "Upper layers handle task-specific output formatting and vocabulary projection (Geva et al., 2022, arXiv:2203.14680). "
+            "Bandarkar et al. (2025) use a similar upper-layer preservation structure. "
+            "Sensitivity to t is deferred to Stage 2."
+        ),
     }
 
     if hidden_state_info:
