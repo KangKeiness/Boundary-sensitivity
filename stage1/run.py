@@ -1,4 +1,4 @@
-"""Stage 1 pipeline: MGSM Telugu evaluation with Qwen2.5-1.5B boundary sweep."""
+"""Stage 1 pipeline: MGSM multilingual evaluation with Qwen2.5-1.5B boundary sweep."""
 
 import argparse
 import gc
