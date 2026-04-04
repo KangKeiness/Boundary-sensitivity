@@ -98,4 +98,6 @@ def load_mgsm(config) -> List[Dict]:
         })
 
     logger.info(f"Loaded {len(samples)} MGSM samples (lang={lang})")
+    if debug_n is None and len(samples) != 250:
+        logger.warning(f"Expected 250 MGSM samples but got {len(samples)}")
     return samples
