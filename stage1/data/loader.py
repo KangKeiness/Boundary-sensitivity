@@ -9,10 +9,11 @@ from typing import List, Dict, Optional
 logger = logging.getLogger(__name__)
 
 PROMPT_TEMPLATE = (
-    "Answer the following math problem step by step. "
-    "At the end, write 'The answer is X.' where X is the numeric answer.\n\n"
+    "Solve the following math problem step by step. "
+    "Show your reasoning first, then write your final answer on the last line in this exact format: "
+    "'The answer is X.' where X is the numeric answer.\n\n"
     "Problem: {question}\n"
-    "Answer:"
+    "Solution:"
 )
 
 TSV_URL = (
@@ -98,4 +99,6 @@ def load_mgsm(config) -> List[Dict]:
         })
 
     logger.info(f"Loaded {len(samples)} MGSM samples (lang={lang})")
+    if debug_n is None and len(samples) != 250:
+        logger.warning(f"Expected 250 MGSM samples but got {len(samples)}")
     return samples

@@ -12,9 +12,10 @@ def parse_answer(output_text: str) -> Dict:
     Extract numeric answer from model output.
 
     Strategy:
-    1. PRIMARY: match "The answer is X" (case-insensitive). Prompt instructs
-       the model to end with exactly this phrase, so it should fire most often.
-    2. SECONDARY fallback: last standalone integer in the text.
+    1. PRIMARY: match any of the multilingual answer phrases. Collects ALL
+       matches across all patterns, then takes the LAST one by position.
+       This handles self-correction (e.g. "answer is 8 ... answer is 18").
+    2. SECONDARY fallback: last standalone number in the text.
        Logged as parse_type="fallback" so we can track frequency.
 
     Returns:
@@ -22,15 +23,26 @@ def parse_answer(output_text: str) -> Dict:
     """
     text = output_text.strip()
 
-    # PRIMARY: "The answer is X" where X starts with digits (may include commas/decimal)
-    primary_match = re.search(
-        r"(?i)the answer is\s*([\d,]+(?:\.\d+)?)",
-        text,
-    )
-    if primary_match:
-        raw = primary_match.group(1)
+    # PRIMARY patterns — order doesn't matter; we take last match by position
+    primary_patterns = [
+        r"(?i)the answer is\s*([\d,]+(?:\.\d+)?)",       # English
+        r"(?i)answer\s*[:=]\s*([\d,]+(?:\.\d+)?)",        # English alt
+        r"(?:答案是|答案为)\s*([\d,]+(?:\.\d+)?)",          # Chinese
+    ]
+
+    all_matches = []  # list of (start_pos, captured_group)
+    for pattern in primary_patterns:
+        for m in re.finditer(pattern, text):
+            all_matches.append((m.start(), m.group(1)))
+
+    if all_matches:
+        # Take the match with the largest start position (last in text)
+        _, raw = max(all_matches, key=lambda x: x[0])
         normalized = _normalize_number(raw)
-        logger.debug("parse_answer primary: raw=%r normalized=%r", raw, normalized)
+        n_total_matches = len(all_matches)
+        logger.debug(
+            f"parse_answer primary (last of {n_total_matches}): raw={raw!r} normalized={normalized!r}"
+        )
         return {
             "parsed_answer": raw,
             "parse_success": True,
@@ -38,7 +50,7 @@ def parse_answer(output_text: str) -> Dict:
             "parse_type": "primary",
         }
 
-    # SECONDARY fallback: last standalone integer in text
+    # SECONDARY fallback: last standalone number in text
     fallback_matches = re.findall(r"\b(\d[\d,]*(?:\.\d+)?)\b", text)
     if fallback_matches:
         raw = fallback_matches[-1]
