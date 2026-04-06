@@ -125,6 +125,11 @@ def compute_bpd(
                 value at the single boundary point; EBPD averages it over
                 all downstream layers.
 
+    Note: per_layer_excess[0] (at l=b) corresponds to BDS_lower for that
+    boundary, NOT BDS_total. BDS_total = BDS_lower + BDS_upper, where upper
+    is computed at l=t. Do not compare EBPD values directly against
+    mean_bds_total from bds_*.json.
+
     Args:
         hidden_states_recipient : {sample_id: tensor [n_layers, hidden_dim]}
         hidden_states_composed  : {sample_id: tensor [n_layers, hidden_dim]}
@@ -254,7 +259,10 @@ def compute_bpd_degradation_correlation(
     Returns:
         Dict with keys:
             rho_bpd, p_bpd     : Spearman rho and p-value for BPD vs degradation
+                                  (None if NaN or insufficient data)
             rho_ebpd, p_ebpd   : Spearman rho and p-value for EBPD vs degradation
+                                  (None if NaN or insufficient data)
+            status             : "valid" | "degenerate" | "insufficient_data"
             boundary_table     : List of per-boundary dicts for inspection
     """
     baseline_acc: float = evaluation["baseline_accuracy"]
@@ -288,20 +296,42 @@ def compute_bpd_degradation_correlation(
             "ebpd_mean":   bpd_results[cond]["ebpd_mean"],
         })
 
+    import math
+
     rho_bpd = p_bpd = rho_ebpd = p_ebpd = None
+    status = "insufficient_data"
+
     if len(bpd_vals) >= 2:
-        rho_bpd,  p_bpd  = spearmanr(bpd_vals,  degs)
-        rho_ebpd, p_ebpd = spearmanr(ebpd_vals, degs)
-        rho_bpd  = float(rho_bpd)
-        p_bpd    = float(p_bpd)
-        rho_ebpd = float(rho_ebpd)
-        p_ebpd   = float(p_ebpd)
+        status = "valid"
+
+        _rho_bpd, _p_bpd = spearmanr(bpd_vals, degs)
+        if math.isnan(_rho_bpd) or math.isnan(_p_bpd):
+            logger.warning(
+                "Spearman correlation returned NaN for bpd — "
+                "likely due to near-constant input values"
+            )
+            status = "degenerate"
+        else:
+            rho_bpd = float(_rho_bpd)
+            p_bpd   = float(_p_bpd)
+
+        _rho_ebpd, _p_ebpd = spearmanr(ebpd_vals, degs)
+        if math.isnan(_rho_ebpd) or math.isnan(_p_ebpd):
+            logger.warning(
+                "Spearman correlation returned NaN for ebpd — "
+                "likely due to near-constant input values"
+            )
+            status = "degenerate"
+        else:
+            rho_ebpd = float(_rho_ebpd)
+            p_ebpd   = float(_p_ebpd)
 
     return {
         "rho_bpd":        rho_bpd,
         "p_bpd":          p_bpd,
         "rho_ebpd":       rho_ebpd,
         "p_ebpd":         p_ebpd,
+        "status":         status,
         "boundary_table": table,
     }
 
@@ -366,6 +396,8 @@ def print_summary(run_dir: str) -> None:
     print(f"BDS-degradation correlation:  rho={_r(bds_rho)}  p={_r(bds_p)}")
     print(f"BPD-degradation correlation:  rho={_r(corr['rho_bpd'])}  p={_r(corr['p_bpd'])}")
     print(f"EBPD-degradation correlation: rho={_r(corr['rho_ebpd'])}  p={_r(corr['p_ebpd'])}")
+    if corr["status"] != "valid":
+        print(f"  [WARNING] Correlation status: {corr['status']}")
 
     # ── Random donor comparison ───────────────────────────────────────────
     print("\nRandom donor comparison:")
@@ -388,6 +420,41 @@ def print_summary(run_dir: str) -> None:
         print(f"{b:>8}  {_fs(hd_acc)}  {_fs(rd_acc)}  {_fs(hd_bpd)}  {_fs(rd_bpd)}")
 
     print()
+
+    # ── EBPD-BDS consistency check ────────────────────────────────────────
+    # per_layer_excess[0] at l=b should match mean_bds_lower from bds_*.json.
+    # (BDS_total = BDS_lower + BDS_upper; do NOT compare against mean_bds_total.)
+    _TOL = 1e-5
+    mismatches: List[str] = []
+    checked = 0
+    for b in boundary_grid:
+        cond = f"hard_swap_b{b}"
+        bpd_r = bpd_results.get(cond)
+        bds_r = bds_results.get(cond)
+        if bpd_r is None or bds_r is None:
+            continue
+        per_layer_excess = bpd_r.get("per_layer_excess", [])
+        if not per_layer_excess:
+            continue
+        ebpd_lower = per_layer_excess[0]
+        bds_lower  = bds_r.get("aggregate", {}).get("mean_bds_lower")
+        if bds_lower is None:
+            continue
+        checked += 1
+        if abs(ebpd_lower - bds_lower) > _TOL:
+            mismatches.append(
+                f"  b={b}: per_layer_excess[0]={ebpd_lower:.6f}  "
+                f"mean_bds_lower={bds_lower:.6f}  diff={ebpd_lower - bds_lower:.2e}"
+            )
+
+    if checked == 0:
+        print("EBPD-BDS consistency check: SKIPPED (no overlapping data)")
+    elif mismatches:
+        print("EBPD-BDS consistency check: FAILED")
+        for msg in mismatches:
+            print(msg)
+    else:
+        print(f"EBPD-BDS consistency check: PASSED ({checked} boundaries checked)")
 
 
 # ─── CLI entry point ─────────────────────────────────────────────────────────
