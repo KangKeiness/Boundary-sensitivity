@@ -9,19 +9,23 @@ Usage (CLI):
     python stage1/analysis/post_analysis.py --run_dir /workspace/outputs/run_20260405_130326
 
 Usage (Jupyter):
-    from stage1.analysis.post_analysis import load_run, compute_bpd, print_summary
+    from stage1.analysis.post_analysis import (
+        load_run, compute_bpd, compute_recovery_metrics,
+        compute_all_metric_correlations, print_summary,
+    )
 """
 
 import argparse
 import json
 import logging
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from scipy.stats import spearmanr
 
-from stage1.analysis.bds import cosine_distance
+from stage1.analysis.bds import cosine_distance, linear_cka_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +242,255 @@ def compute_bpd_sweep(
     return results
 
 
+# ─── Recovery-side metrics ───────────────────────────────────────────────────
+
+def _pairwise_cosine_distance_matrix(H: torch.Tensor) -> torch.Tensor:
+    """Pairwise centered cosine distance matrix for rows of H [n, d]."""
+    H = H.float()
+    n = H.shape[0]
+    D = torch.zeros(n, n, dtype=torch.float32)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = cosine_distance(H[i], H[j]).item()
+            D[i, j] = d
+            D[j, i] = d
+    return D
+
+
+def compute_recovery_metrics(
+    hidden_states_recipient: Dict[str, torch.Tensor],
+    hidden_states_composed: Dict[str, torch.Tensor],
+    t_fixed: int = 20,
+    n_layers: int = 28,
+) -> Dict:
+    """
+    Compute all recovery-zone metrics comparing composed vs recipient hidden states.
+
+    Recovery zone: layers t_fixed to n_layers-1 inclusive.
+
+    Metrics:
+        RD_cos   — mean cosine distance across recovery layers, averaged over samples
+        RD_l2    — mean L2 distance across recovery layers, averaged over samples
+        FLD_cos  — cosine distance at the final layer, averaged over samples
+        FLD_l2   — L2 distance at the final layer, averaged over samples
+        Rec_CKA  — 1 - linear_CKA per recovery layer, averaged across layers
+        Rec_RSA  — 1 - Spearman(RDM_comp, RDM_rec) per recovery layer, averaged
+
+    Args:
+        hidden_states_recipient : {sample_id: tensor [n_layers, hidden_dim]}
+        hidden_states_composed  : {sample_id: tensor [n_layers, hidden_dim]}
+        t_fixed  : first recovery layer (upper boundary).
+        n_layers : total number of layers (default 28 for Qwen2.5-1.5B).
+
+    Returns:
+        Dict with per-metric averages, per-layer breakdowns, and per-sample values.
+    """
+    common_ids = sorted(set(hidden_states_recipient) & set(hidden_states_composed))
+    if not common_ids:
+        raise ValueError("No common sample IDs between recipient and composed hidden states.")
+
+    L = n_layers
+    recovery_layers = list(range(t_fixed, L))  # t_fixed .. L-1
+    n_recovery = len(recovery_layers)
+    n_samples = len(common_ids)
+
+    # ── Per-sample, per-layer accumulators for RD and FLD ────────────────
+    layer_drift_cos_sums = [0.0] * n_recovery
+    layer_drift_l2_sums = [0.0] * n_recovery
+    per_sample_rd_cos: List[float] = []
+    per_sample_fld_cos: List[float] = []
+
+    # ── Per-layer sample matrices for CKA and RSA ────────────────────────
+    # H_comp_per_layer[i] and H_rec_per_layer[i] will be [n_samples, hidden_dim]
+    H_comp_per_layer: List[List[torch.Tensor]] = [[] for _ in range(n_recovery)]
+    H_rec_per_layer: List[List[torch.Tensor]] = [[] for _ in range(n_recovery)]
+
+    for sid in common_ids:
+        h_rec = hidden_states_recipient[sid].float()
+        h_comp = hidden_states_composed[sid].float()
+
+        sample_drift_cos: List[float] = []
+
+        for i, l in enumerate(recovery_layers):
+            d_cos = cosine_distance(h_comp[l], h_rec[l]).item()
+            d_l2 = torch.norm(h_comp[l] - h_rec[l], p=2).item()
+
+            layer_drift_cos_sums[i] += d_cos
+            layer_drift_l2_sums[i] += d_l2
+            sample_drift_cos.append(d_cos)
+
+            H_comp_per_layer[i].append(h_comp[l])
+            H_rec_per_layer[i].append(h_rec[l])
+
+        per_sample_rd_cos.append(float(sum(sample_drift_cos) / len(sample_drift_cos)))
+        # FLD: last recovery layer (L-1)
+        fld_cos = cosine_distance(h_comp[L - 1], h_rec[L - 1]).item()
+        per_sample_fld_cos.append(fld_cos)
+
+    # ── Per-layer averages ───────────────────────────────────────────────
+    per_layer_drift_cos = [s / n_samples for s in layer_drift_cos_sums]
+    per_layer_drift_l2 = [s / n_samples for s in layer_drift_l2_sums]
+
+    rd_cos = float(sum(per_layer_drift_cos) / n_recovery)
+    rd_l2 = float(sum(per_layer_drift_l2) / n_recovery)
+    fld_cos = float(sum(per_sample_fld_cos) / n_samples)
+
+    # FLD L2: recompute from final layer across samples
+    fld_l2_sum = 0.0
+    for sid in common_ids:
+        h_rec = hidden_states_recipient[sid].float()
+        h_comp = hidden_states_composed[sid].float()
+        fld_l2_sum += torch.norm(h_comp[L - 1] - h_rec[L - 1], p=2).item()
+    fld_l2 = float(fld_l2_sum / n_samples)
+
+    # ── CKA per recovery layer ───────────────────────────────────────────
+    per_layer_cka_shift: List[float] = []
+    for i in range(n_recovery):
+        H_comp_mat = torch.stack(H_comp_per_layer[i])  # [n_samples, hidden_dim]
+        H_rec_mat = torch.stack(H_rec_per_layer[i])
+        cka_val = linear_cka_matrix(H_comp_mat, H_rec_mat)
+        per_layer_cka_shift.append(1.0 - cka_val)
+
+    recovery_cka = float(sum(per_layer_cka_shift) / n_recovery)
+
+    # ── RSA per recovery layer ───────────────────────────────────────────
+    per_layer_rsa_shift: List[float] = []
+    for i in range(n_recovery):
+        H_comp_mat = torch.stack(H_comp_per_layer[i])
+        H_rec_mat = torch.stack(H_rec_per_layer[i])
+
+        rdm_comp = _pairwise_cosine_distance_matrix(H_comp_mat)
+        rdm_rec = _pairwise_cosine_distance_matrix(H_rec_mat)
+
+        # Extract upper triangles
+        idx = torch.triu_indices(n_samples, n_samples, offset=1)
+        upper_comp = rdm_comp[idx[0], idx[1]].numpy()
+        upper_rec = rdm_rec[idx[0], idx[1]].numpy()
+
+        if len(upper_comp) < 2:
+            per_layer_rsa_shift.append(0.0)
+            continue
+
+        rho, _ = spearmanr(upper_comp, upper_rec)
+        if math.isnan(rho):
+            logger.warning("RSA returned NaN at recovery layer %d — treating as 0 correlation", recovery_layers[i])
+            per_layer_rsa_shift.append(1.0)
+        else:
+            per_layer_rsa_shift.append(1.0 - float(rho))
+
+    recovery_rsa = float(sum(per_layer_rsa_shift) / n_recovery)
+
+    return {
+        "rd_cosine": rd_cos,
+        "rd_l2": rd_l2,
+        "fld_cosine": fld_cos,
+        "fld_l2": fld_l2,
+        "recovery_cka": recovery_cka,
+        "recovery_rsa": recovery_rsa,
+        "per_layer_drift_cosine": per_layer_drift_cos,
+        "per_layer_drift_l2": per_layer_drift_l2,
+        "per_layer_cka_shift": per_layer_cka_shift,
+        "per_layer_rsa_shift": per_layer_rsa_shift,
+        "per_sample_rd_cosine": per_sample_rd_cos,
+        "per_sample_fld_cosine": per_sample_fld_cos,
+        "n_samples": n_samples,
+        "recovery_layers": [t_fixed, L - 1],
+    }
+
+
+def compute_recovery_sweep(run_data: Dict) -> Dict[str, Dict]:
+    """
+    Compute recovery metrics for every condition in a loaded run.
+
+    Args:
+        run_data: Output of load_run().
+
+    Returns:
+        {condition_name: recovery_metrics_dict}
+    """
+    hs = run_data["hidden_states"]
+    boundary_grid = run_data["boundary_grid"]
+    t_fixed = run_data["t_fixed"]
+    n_layers = run_data["manifest"].get("hidden_state_layer_count", 28)
+
+    if "no_swap" not in hs:
+        raise ValueError("no_swap hidden states not found — required as recipient baseline.")
+
+    hs_recipient = hs["no_swap"]
+    results: Dict[str, Dict] = {}
+
+    for b in boundary_grid:
+        for prefix in ("hard_swap_b", "random_donor_b"):
+            cond = f"{prefix}{b}"
+            if cond not in hs:
+                logger.warning("Hidden states missing for %s — skipping recovery metrics.", cond)
+                continue
+            logger.info("Computing recovery metrics for %s", cond)
+            results[cond] = compute_recovery_metrics(
+                hs_recipient, hs[cond], t_fixed=t_fixed, n_layers=n_layers,
+            )
+
+    return results
+
+
+# ─── All-metric correlation ─────────────────────────────────────────────────
+
+def compute_all_metric_correlations(
+    boundary_grid: List[int],
+    recovery_results: Dict[str, Dict],
+    evaluation: Dict,
+) -> Dict:
+    """
+    Compute Spearman correlation of each recovery metric with accuracy degradation.
+
+    Only hard_swap conditions are used; random_donor is excluded.
+
+    Args:
+        boundary_grid    : List of boundary values tested.
+        recovery_results : {condition_name: recovery_metrics_dict} from compute_recovery_sweep.
+        evaluation       : evaluation.json dict.
+
+    Returns:
+        Dict keyed by metric name, each with {rho, p, status}.
+    """
+    baseline_acc: float = evaluation["baseline_accuracy"]
+    accuracies: Dict = evaluation["accuracies"]
+
+    metric_keys = ["rd_cosine", "rd_l2", "fld_cosine", "fld_l2", "recovery_cka", "recovery_rsa"]
+    metric_vals: Dict[str, List[float]] = {k: [] for k in metric_keys}
+    degs: List[float] = []
+
+    for b in boundary_grid:
+        cond = f"hard_swap_b{b}"
+        if cond not in recovery_results:
+            continue
+        cond_acc = accuracies.get(cond, {}).get("accuracy")
+        if cond_acc is None:
+            continue
+
+        degradation = max(0.0, baseline_acc - cond_acc)
+        degs.append(degradation)
+        for k in metric_keys:
+            metric_vals[k].append(recovery_results[cond][k])
+
+    correlations: Dict[str, Dict] = {}
+    for k in metric_keys:
+        if len(degs) < 2:
+            correlations[k] = {"rho": None, "p": None, "status": "insufficient_data"}
+            continue
+
+        rho_val, p_val = spearmanr(metric_vals[k], degs)
+        if math.isnan(rho_val) or math.isnan(p_val):
+            logger.warning(
+                "Spearman correlation returned NaN for %s — likely constant input values", k
+            )
+            correlations[k] = {"rho": None, "p": None, "status": "degenerate"}
+        else:
+            correlations[k] = {"rho": float(rho_val), "p": float(p_val), "status": "valid"}
+
+    return correlations
+
+
 # ─── BPD-degradation correlation ─────────────────────────────────────────────
 
 def compute_bpd_degradation_correlation(
@@ -296,8 +549,6 @@ def compute_bpd_degradation_correlation(
             "ebpd_mean":   bpd_results[cond]["ebpd_mean"],
         })
 
-    import math
-
     rho_bpd = p_bpd = rho_ebpd = p_ebpd = None
     status = "insufficient_data"
 
@@ -343,8 +594,9 @@ def print_summary(run_dir: str) -> None:
     Load a completed run and print a comparison table of all metrics.
 
     Includes per-boundary accuracy, BDS, BPD, EBPD, and random_donor
-    comparison rows. Also prints Spearman correlations for all three
-    metric families vs. accuracy degradation.
+    comparison rows. Also prints Spearman correlations for all metric
+    families vs. accuracy degradation, including recovery-zone metrics
+    (RD cosine/L2, FLD cosine/L2, Recovery CKA, Recovery RSA).
 
     Args:
         run_dir: Path to the run directory.
@@ -356,6 +608,10 @@ def print_summary(run_dir: str) -> None:
     bpd_results = compute_bpd_sweep(run_data)
     corr = compute_bpd_degradation_correlation(
         run_data["boundary_grid"], bpd_results, run_data["evaluation"]
+    )
+    recovery_results = compute_recovery_sweep(run_data)
+    recovery_corr = compute_all_metric_correlations(
+        run_data["boundary_grid"], recovery_results, run_data["evaluation"]
     )
 
     evaluation   = run_data["evaluation"]
@@ -455,6 +711,68 @@ def print_summary(run_dir: str) -> None:
             print(msg)
     else:
         print(f"EBPD-BDS consistency check: PASSED ({checked} boundaries checked)")
+
+    # ── Recovery Metric Comparison ────────────────────────────────────────
+    print(f"\n{'=' * 67}")
+    print("=== Recovery Metric Comparison ===")
+    print(f"{'Metric':<18}{'Mean Value':>12}{'Corr w/ Degradation':>21}{'p-value':>10}{'Status':>8}")
+    print("\u2500" * 67)
+
+    # Recovery metrics
+    recovery_rows = [
+        ("RD (cosine)",    "rd_cosine"),
+        ("RD (L2)",        "rd_l2"),
+        ("FLD (cosine)",   "fld_cosine"),
+        ("FLD (L2)",       "fld_l2"),
+        ("Recovery CKA",   "recovery_cka"),
+        ("Recovery RSA",   "recovery_rsa"),
+    ]
+
+    # Compute mean of each recovery metric across hard_swap conditions
+    for label, key in recovery_rows:
+        vals = [
+            recovery_results[f"hard_swap_b{b}"][key]
+            for b in boundary_grid
+            if f"hard_swap_b{b}" in recovery_results
+        ]
+        mean_val = sum(vals) / len(vals) if vals else float("nan")
+        rc = recovery_corr.get(key, {})
+        rho = rc.get("rho")
+        p = rc.get("p")
+        status = rc.get("status", "N/A")
+        print(
+            f"{label:<18}{mean_val:>12.4f}"
+            f"{_r(rho):>21}{_r(p):>10}"
+            f"{status:>8}"
+        )
+
+    # BDS row (existing)
+    bds_mean_vals = [
+        bds_results.get(f"hard_swap_b{b}", {}).get("aggregate", {}).get("mean_bds_total")
+        for b in boundary_grid
+    ]
+    bds_mean_vals = [v for v in bds_mean_vals if v is not None]
+    bds_mean = sum(bds_mean_vals) / len(bds_mean_vals) if bds_mean_vals else float("nan")
+    print(
+        f"{'BDS (existing)':<18}{bds_mean:>12.4f}"
+        f"{_r(bds_rho):>21}{_r(bds_p):>10}"
+        f"{'valid' if bds_rho is not None else 'N/A':>8}"
+    )
+
+    # BPD row (existing)
+    bpd_mean_vals = [
+        bpd_results.get(f"hard_swap_b{b}", {}).get("bpd_mean")
+        for b in boundary_grid
+    ]
+    bpd_mean_vals = [v for v in bpd_mean_vals if v is not None]
+    bpd_mean = sum(bpd_mean_vals) / len(bpd_mean_vals) if bpd_mean_vals else float("nan")
+    print(
+        f"{'BPD (existing)':<18}{bpd_mean:>12.4f}"
+        f"{_r(corr['rho_bpd']):>21}{_r(corr['p_bpd']):>10}"
+        f"{corr['status']:>8}"
+    )
+
+    print()
 
 
 # ─── CLI entry point ─────────────────────────────────────────────────────────
