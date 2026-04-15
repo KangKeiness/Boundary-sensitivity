@@ -1,0 +1,72 @@
+{
+  "verdict": "PASS",
+  "round": 2,
+  "spec_conformance": {
+    "matched": [
+      "PHASE_C_TXT_HEADER at stage1/run_phase_c.py:56-59 is byte-equal to spec §11.10 literal: UTF-8 bytes 'Phase C \\xe2\\x80\\x94 mediation-style decomposition of prompt-side restoration intervention (not a formal NIE/NDE decomposition)' (em-dash U+2014, encoded as E2 80 94)",
+      "Matching print() at stage1/run_phase_c.py:424 also uses U+2014 (em-dash) in 'Phase C \\u2014 mediation-style decomposition (prompt-side only)'",
+      "New test test_phase_c_txt_header_byte_equals_spec_literal at stage1/tests/test_phase_c_mediation.py:57-71 asserts byte-equality against the spec literal, and explicitly asserts '\\u2014' in header and 'Phase C - ' NOT in header",
+      "End-to-end CLI test at stage1/tests/test_phase_c_mediation.py:329-340 re-asserts PHASE_C_TXT_HEADER == SPEC_HEADER_LITERAL and that SPEC_HEADER_LITERAL appears verbatim in the written summary.txt",
+      "Round-2 nit #3 fixed: phase_c_summary.json.environment now records 'acc_cross_check_tolerance': 2e-3 (stage1/run_phase_c.py:281)",
+      "Round-2 nit #4 fixed: _cross_check_accuracies now raises RuntimeError with an explicit Phase-B-schema-drift message when BOTH 'no_patch_accuracy' and 'clean_baseline_accuracy' are absent from phase_b_summary.json (stage1/run_phase_c.py:526-531)",
+      "All Round-1 matched items remain intact: mediation.py restoration/residual/proportion with 1000-resample paired bootstrap seed=0, sorted-intersection sample_id pairing, alphabetical tie-break on claim-eligible conditions, CLI flags, MANDATED_CAVEAT byte-exact, FORBIDDEN_PHRASES_PHASE_B/PHASE_C tuples, check_artifacts_for_forbidden phrases= kwarg, post_analysis CONDITION_NAME_PREFIXES + _enumerate_conditions with legacy-order byte-identity, np.float32 casts, np.random.seed + default_rng determinism, upstream_provenance SHA-256"
+    ],
+    "missing": [],
+    "extra": [
+      "--config flag (accept-and-logged-only) retained for cross-phase CLI parity; writer-agent hard rule satisfied. Non-harmful.",
+      "Accuracy cross-check tolerance 2e-3 vs spec §10's 1e-6 — documented deviation; now persisted as environment.acc_cross_check_tolerance so downstream readers see the relaxation.",
+      "FORBIDDEN_PHRASES_PHASE_C omits 'nie/nde' / 'nde/nie' literal tokens because they collide case-insensitively with the mandated caveat ('NIE/NDE decomposition'); spelled-out forms still blocked. Acceptable resolution of spec self-contradiction."
+    ]
+  },
+  "findings": [
+    {
+      "severity": "med",
+      "file": "stage1/tests/test_post_analysis_condition_names.py",
+      "line": 0,
+      "category": "test",
+      "claim": "Unchanged from Round 1: module-level pytest.importorskip('torch') skips all 9 backward-compat tests when torch is unavailable. H3 byte-identical-ordering guard not exercised in writer's sandbox.",
+      "evidence": "Writer's Round-1 tests_run details reported '13 passed, 1 skipped'. Writer explicitly deferred (deferred_nits: watcher-finding-#2) with rationale that lifting _enumerate_conditions out of post_analysis.py would touch a pinned Phase A file whose legacy emission-order contract is already pinned by test_post_analysis_condition_names.py's byte-identical-ordering test.",
+      "suggested_fix": "Re-run stage1/tests/test_post_analysis_condition_names.py in a torch-enabled environment (Colab / GPU box) and attach the passing output. Non-blocking for writer handoff; CI/acceptance-smoke-test blocker only."
+    },
+    {
+      "severity": "nit",
+      "file": "stage1/run_phase_c.py",
+      "line": 477,
+      "category": "other",
+      "claim": "Unchanged from Round 1: summary.json is written twice (pre-gate then rewritten with gate results). Writer explicitly deferred (deferred_nits: watcher-finding-#5) as a defensive-and-correct pattern.",
+      "evidence": "Writer rationale: 'gate already reads summary.json as part of its contract; not worth refactor risk for pre-final-IO scan path.'",
+      "suggested_fix": "Accept as-is. Defensive pattern is fine."
+    }
+  ],
+  "reproducibility_checklist": {
+    "seed_wired": true,
+    "config_logged": true,
+    "run_name_required": false,
+    "determinism_flags": true,
+    "data_hash_recorded": true
+  },
+  "must_fix_before_merge": [],
+  "can_ship_with_followup": [
+    "Re-run stage1/tests/test_post_analysis_condition_names.py in a torch-enabled environment (Colab / GPU box) and attach the passing output to exercise H3 backward-compat (writer deferred-nit #2).",
+    "Consider Phase B spec errata to write unrounded accuracies so the acc_cross_check_tolerance can be tightened from 2e-3 to spec §10's 1e-6 — Phase B spec update, not a Phase C blocker."
+  ],
+  "checklist_coverage": {
+    "1_seed": "matched — np.random.seed(seed) at entrypoint; bootstrap uses default_rng(seed); no bare random.seed(). Unchanged from Round 1.",
+    "2_determinism": "n/a — analysis-only, CPU-only numpy. Bootstrap deterministic by construction via default_rng(seed).",
+    "3_device_dtype": "n/a — no model load; float32 explicit in _paired_bootstrap and _acc.",
+    "4_loss_masking": "n/a — no training, no loss.",
+    "5_tokenizer_pinning": "n/a — no model/tokenizer load; Phase B environment block copied verbatim into upstream_provenance.",
+    "6_eval_path_purity": "n/a — no DataLoader; JSONLs read directly.",
+    "7_data_collator": "n/a — no collator.",
+    "8_grad_accum": "n/a — no training.",
+    "9_checkpoint_io": "n/a — no checkpoint.",
+    "10_metric_reduction": "matched — per-restoration-condition rows, no per-language breakdown (MGSM-zh only, inherited).",
+    "11_train_eval_leakage": "n/a — no splits in Phase C; reads Phase B JSONLs as pinned inputs.",
+    "12_test_coverage": "matched — mediation.py covered by 14 tests in test_phase_c_mediation.py (13 Round-1 + 1 Round-2 byte-equal header test); post_analysis.py edits covered by 9 tests in test_post_analysis_condition_names.py (torch-gated; see finding med)."
+  },
+  "round_2_verification": {
+    "em_dash_header_bytes_verified": "U+2014 (UTF-8: E2 80 94) present at stage1/run_phase_c.py:57 and :424; ASCII hyphen-minus after 'Phase C' is ABSENT in both locations",
+    "spec_literal_byte_equality_test_present": "stage1/tests/test_phase_c_mediation.py:57-71 (standalone, no torch/fixture dependency) plus in-CLI assertion at :329-340",
+    "no_regressions_detected": "acc_cross_check_tolerance (nit #3) and Phase-B-schema-drift raise (nit #4) both in place; all Round-1 matched items preserved; writer reports 14/14 Phase C tests green and Phase B forbidden-phrase tests still green"
+  }
+}

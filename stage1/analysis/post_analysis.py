@@ -20,7 +20,8 @@ import json
 import logging
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+import sys
+from typing import Dict, List, Optional, Tuple  # noqa: F401 — Tuple used below
 
 import torch
 from scipy.stats import spearmanr
@@ -28,6 +29,106 @@ from scipy.stats import spearmanr
 from stage1.analysis.bds import cosine_distance, linear_cka_matrix
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Condition-name enumeration ──────────────────────────────────────────────
+#
+# Phase C spec §8: extend the set of recognized condition-name prefixes used by
+# ``compute_bpd_sweep`` to include Phase A width-confound grid families
+# (``fixed_w4_``, ``fixed_b8_``, ``random_fixed_``) and Phase B restoration /
+# corruption conditions (``patch_``, ``corrupt_``), in addition to the legacy
+# Phase A / Stage 2 prefixes (``hard_swap_b``, ``random_donor_b``).
+#
+# The extension is ADDITIVE. The iteration order for the legacy subset is
+# preserved: for every ``b`` in ``boundary_grid``, ``hard_swap_b{b}`` is
+# followed by ``random_donor_b{b}``. Only the NEW families are discovered via
+# ``sorted(hs.keys())`` filtering, and they are appended AFTER the legacy
+# subset so that every pre-existing callsite sees byte-identical output when
+# only legacy keys are present.
+
+CONDITION_NAME_PREFIXES: Tuple[str, ...] = (
+    "hard_swap_b",       # Phase A / Stage 2 (pre-existing)
+    "random_donor_b",    # Phase A / Stage 2 (pre-existing)
+    "fixed_w4_",         # Phase A width-confound grid
+    "fixed_b8_",         # Phase A width-confound grid
+    "random_fixed_",     # Phase A random-donor variant
+    "patch_",            # Phase B restoration conditions
+    "corrupt_",          # Phase B reverse-corruption conditions
+)
+
+_LEGACY_B_SUFFIX_PREFIXES: Tuple[str, ...] = ("hard_swap_b", "random_donor_b")
+
+
+def _enumerate_conditions(hs: Dict, boundary_grid: List[int]) -> List[str]:
+    """Return condition-name keys of ``hs`` that match known prefix families.
+
+    Iteration order:
+        1. For each ``b`` in ``boundary_grid``, emit ``hard_swap_b{b}`` then
+           ``random_donor_b{b}`` (byte-identical to the pre-change loop).
+        2. Then append keys whose prefix is in the new families
+           (``fixed_w4_``, ``fixed_b8_``, ``random_fixed_``, ``patch_``,
+           ``corrupt_``) in ``sorted(hs.keys())`` order.
+
+    Keys absent from ``hs`` are skipped (with a WARNING log for the legacy
+    prefixes to preserve the pre-change warning behaviour).
+    """
+    out: List[str] = []
+    # Legacy prefixes: preserve pre-change order and warning behaviour.
+    for b in boundary_grid:
+        for prefix in _LEGACY_B_SUFFIX_PREFIXES:
+            cond = f"{prefix}{b}"
+            if cond not in hs:
+                logger.warning("Hidden states missing for %s — skipping BPD.", cond)
+                continue
+            out.append(cond)
+
+    # New families: sorted, filtered, de-duplicated against already-emitted.
+    new_prefixes = tuple(
+        p for p in CONDITION_NAME_PREFIXES if p not in _LEGACY_B_SUFFIX_PREFIXES
+    )
+    emitted = set(out)
+    for key in sorted(hs.keys()):
+        if key in emitted:
+            continue
+        for p in new_prefixes:
+            if key.startswith(p):
+                out.append(key)
+                emitted.add(key)
+                break
+    return out
+
+
+def _infer_b_for_condition(cond: str, run_data: Dict) -> int:
+    """Infer the boundary value ``b`` for a non-legacy condition name.
+
+    For legacy ``hard_swap_b{b}`` / ``random_donor_b{b}`` names this helper
+    is not used (the caller iterates ``boundary_grid`` directly). For new
+    families, ``b`` is resolved from the condition suffix where possible
+    (``fixed_b8_*`` → 8) or from ``run_data['t_fixed']`` as a Phase B
+    compose-meta fallback (``patch_*``, ``corrupt_*`` — b=8 per spec).
+    """
+    if cond.startswith("fixed_b"):
+        # fixed_b8_xxx → 8
+        suffix = cond[len("fixed_b"):]
+        num = []
+        for ch in suffix:
+            if ch.isdigit():
+                num.append(ch)
+            else:
+                break
+        if num:
+            return int("".join(num))
+    if cond.startswith("fixed_w"):
+        # fixed_w4_pos1 → the grid is width-confound; b is not meaningful.
+        # Fall through to boundary_grid[-1] as a conservative default.
+        pass
+    if cond.startswith("patch_") or cond.startswith("corrupt_"):
+        # Phase B compose_meta.b == 8 by construction.
+        return 8
+    grid = run_data.get("boundary_grid") or []
+    if grid:
+        return int(grid[-1])
+    return 8
 
 
 # ─── Loading ─────────────────────────────────────────────────────────────────
@@ -230,16 +331,37 @@ def compute_bpd_sweep(
     hs_recipient = hs["no_swap"]
     results: Dict[str, Dict] = {}
 
-    for b in boundary_grid:
-        for prefix in ("hard_swap_b", "random_donor_b"):
-            cond = f"{prefix}{b}"
-            if cond not in hs:
-                logger.warning("Hidden states missing for %s — skipping BPD.", cond)
+    # Legacy emission first (byte-identical to the pre-Phase-C loop).
+    enumerated = _enumerate_conditions(hs, boundary_grid)
+    for cond in enumerated:
+        # Resolve ``b`` for this condition.
+        if cond.startswith("hard_swap_b") or cond.startswith("random_donor_b"):
+            # Parse trailing integer after the shared prefix.
+            suffix = cond.split("_b")[-1]
+            try:
+                b = int(suffix)
+            except ValueError:
+                logger.warning("Unable to parse boundary from %s — skipping.", cond)
                 continue
-            logger.info("Computing BPD for %s (b=%d)", cond, b)
-            results[cond] = compute_bpd(hs_recipient, hs[cond], b, t_fixed, n_layers=n_layers)
+        else:
+            b = _infer_b_for_condition(cond, run_data)
+        logger.info("Computing BPD for %s (b=%d)", cond, b)
+        results[cond] = compute_bpd(hs_recipient, hs[cond], b, t_fixed, n_layers=n_layers)
 
     return results
+
+
+# ─── Progress helper ─────────────────────────────────────────────────────────
+
+def _progress(current: int, total: int, label: str, bar_len: int = 30) -> None:
+    """Print an inline progress bar to stderr (no newline until 100%)."""
+    frac = current / total if total > 0 else 1.0
+    filled = int(bar_len * frac)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    pct = frac * 100
+    end = "\n" if current == total else ""
+    sys.stderr.write(f"\r  {label} |{bar}| {pct:5.1f}% ({current}/{total}){end}")
+    sys.stderr.flush()
 
 
 # ─── Recovery-side metrics ───────────────────────────────────────────────────
@@ -305,7 +427,7 @@ def compute_recovery_metrics(
     H_comp_per_layer: List[List[torch.Tensor]] = [[] for _ in range(n_recovery)]
     H_rec_per_layer: List[List[torch.Tensor]] = [[] for _ in range(n_recovery)]
 
-    for sid in common_ids:
+    for s_idx, sid in enumerate(common_ids):
         h_rec = hidden_states_recipient[sid].float()
         h_comp = hidden_states_composed[sid].float()
 
@@ -326,6 +448,7 @@ def compute_recovery_metrics(
         # FLD: last recovery layer (L-1)
         fld_cos = cosine_distance(h_comp[L - 1], h_rec[L - 1]).item()
         per_sample_fld_cos.append(fld_cos)
+        _progress(s_idx + 1, n_samples, "RD/FLD")
 
     # ── Per-layer averages ───────────────────────────────────────────────
     per_layer_drift_cos = [s / n_samples for s in layer_drift_cos_sums]
@@ -350,6 +473,7 @@ def compute_recovery_metrics(
         H_rec_mat = torch.stack(H_rec_per_layer[i])
         cka_val = linear_cka_matrix(H_comp_mat, H_rec_mat)
         per_layer_cka_shift.append(1.0 - cka_val)
+        _progress(i + 1, n_recovery, "CKA   ")
 
     recovery_cka = float(sum(per_layer_cka_shift) / n_recovery)
 
@@ -369,6 +493,7 @@ def compute_recovery_metrics(
 
         if len(upper_comp) < 2:
             per_layer_rsa_shift.append(0.0)
+            _progress(i + 1, n_recovery, "RSA   ")
             continue
 
         rho, _ = spearmanr(upper_comp, upper_rec)
@@ -377,6 +502,7 @@ def compute_recovery_metrics(
             per_layer_rsa_shift.append(1.0)
         else:
             per_layer_rsa_shift.append(1.0 - float(rho))
+        _progress(i + 1, n_recovery, "RSA   ")
 
     recovery_rsa = float(sum(per_layer_rsa_shift) / n_recovery)
 
@@ -419,16 +545,20 @@ def compute_recovery_sweep(run_data: Dict) -> Dict[str, Dict]:
     hs_recipient = hs["no_swap"]
     results: Dict[str, Dict] = {}
 
+    # Build condition list for progress tracking
+    conditions = []
     for b in boundary_grid:
         for prefix in ("hard_swap_b", "random_donor_b"):
             cond = f"{prefix}{b}"
-            if cond not in hs:
-                logger.warning("Hidden states missing for %s — skipping recovery metrics.", cond)
-                continue
-            logger.info("Computing recovery metrics for %s", cond)
-            results[cond] = compute_recovery_metrics(
-                hs_recipient, hs[cond], t_fixed=t_fixed, n_layers=n_layers,
-            )
+            if cond in hs:
+                conditions.append((b, cond))
+
+    for c_idx, (b, cond) in enumerate(conditions):
+        sys.stderr.write(f"\n[{c_idx + 1}/{len(conditions)}] {cond}\n")
+        logger.info("Computing recovery metrics for %s", cond)
+        results[cond] = compute_recovery_metrics(
+            hs_recipient, hs[cond], t_fixed=t_fixed, n_layers=n_layers,
+        )
 
     return results
 
@@ -775,16 +905,223 @@ def print_summary(run_dir: str) -> None:
     print()
 
 
+# ─── Phase A analysis functions (additive — D8) ──────────────────────────────
+
+def load_phase_a_run(run_dir: str) -> Dict:
+    """
+    Load all Phase A artifacts from a completed phase_a run directory.
+
+    Expects the following files (written by stage1/run_phase_a.py):
+      - manifest.json
+      - phase_a_summary.json
+      - phase_a_all_conditions.csv
+      - grid1_position_effect.csv
+      - grid2_width_effect.csv
+      - phase_a_summary.txt
+
+    Args:
+        run_dir: Absolute path to the Phase A run directory.
+
+    Returns:
+        Dict with keys:
+            manifest              : full manifest.json dict
+            summary_json          : full phase_a_summary.json dict
+            all_conditions_csv    : List[Dict] rows from phase_a_all_conditions.csv
+            grid1_csv             : List[Dict] rows from grid1_position_effect.csv
+            grid2_csv             : List[Dict] rows from grid2_width_effect.csv
+            summary_txt           : str content of phase_a_summary.txt
+    """
+    import csv as _csv
+
+    run_dir = os.path.abspath(run_dir)
+
+    def _load_json(fname: str) -> Dict:
+        with open(os.path.join(run_dir, fname)) as f:
+            return json.load(f)
+
+    def _load_csv(fname: str) -> List[Dict]:
+        path = os.path.join(run_dir, fname)
+        with open(path, newline="") as f:
+            return list(_csv.DictReader(f))
+
+    def _load_txt(fname: str) -> str:
+        with open(os.path.join(run_dir, fname), encoding="utf-8") as f:
+            return f.read()
+
+    return {
+        "manifest":           _load_json("manifest.json"),
+        "summary_json":       _load_json("phase_a_summary.json"),
+        "all_conditions_csv": _load_csv("phase_a_all_conditions.csv"),
+        "grid1_csv":          _load_csv("grid1_position_effect.csv"),
+        "grid2_csv":          _load_csv("grid2_width_effect.csv"),
+        "summary_txt":        _load_txt("phase_a_summary.txt"),
+    }
+
+
+def compute_phase_a_primary_table(run_data: Dict, grid: str) -> List[Dict]:
+    """
+    Return the primary-metric table for a Phase A grid.
+
+    PRIMARY metrics (directly comparable across all Phase A conditions):
+      condition, b, t, width, accuracy, degradation, fld_cos, fld_l2
+
+    SECONDARY/EXPLORATORY metrics (not included — recovery-zone length varies):
+      RD_cos, RD_l2, BPD_mean, EBPD_mean, CKA, RSA
+
+    Args:
+        run_data: Output of load_phase_a_run().
+        grid: One of "grid1" (position-effect) or "grid2" (width-effect).
+
+    Returns:
+        List of dicts with PRIMARY metric columns only.
+    """
+    _VALID_GRIDS = {"grid1", "grid2"}
+    if grid not in _VALID_GRIDS:
+        raise ValueError(f"grid must be one of {_VALID_GRIDS}, got {grid!r}")
+
+    key = "grid1_csv" if grid == "grid1" else "grid2_csv"
+    raw_rows = run_data[key]
+
+    PRIMARY_COLS = ["condition", "b", "t", "width", "accuracy", "degradation", "fld_cos", "fld_l2"]
+    result: List[Dict] = []
+    for row in raw_rows:
+        filtered = {col: row[col] for col in PRIMARY_COLS if col in row}
+        # Cast numeric strings back to float/int
+        for num_col in ("b", "t", "width"):
+            if num_col in filtered and filtered[num_col] not in (None, "", "None"):
+                try:
+                    filtered[num_col] = int(filtered[num_col])
+                except (ValueError, TypeError):
+                    pass
+        for float_col in ("accuracy", "degradation", "fld_cos", "fld_l2"):
+            if float_col in filtered and filtered[float_col] not in (None, "", "None"):
+                try:
+                    filtered[float_col] = float(filtered[float_col])
+                except (ValueError, TypeError):
+                    pass
+        result.append(filtered)
+    return result
+
+
+def print_phase_a_summary(run_dir: str) -> None:
+    """
+    Load a completed Phase A run and print PRIMARY two-grid tables.
+
+    Output includes:
+      - PRIMARY metrics header (A9)
+      - Grid 1: position-effect table (fixed_w4_pos* + random_fixed_w4_pos*)
+      - Grid 2: width-effect table (fixed_b8_w* + random_fixed_b8_w*)
+      - PRIMARY vs SECONDARY classification (A9 / 10.3)
+      - primary_metrics_note from JSON (A5)
+
+    Does NOT touch Stage 1 entry points (print_summary, compute_recovery_sweep).
+
+    Args:
+        run_dir: Path to the Phase A run directory.
+    """
+    run_data = load_phase_a_run(run_dir)
+    summary_json = run_data["summary_json"]
+    manifest = run_data["manifest"]
+
+    print()
+    print("=" * 70)
+    print("PHASE A — WIDTH CONFOUND SEPARATION GRID  [post_analysis]")
+    print("=" * 70)
+    print(f"Run: {os.path.abspath(run_dir)}")
+    print(f"Baseline accuracy (no_swap): {summary_json.get('baseline_accuracy', 'N/A')}")
+    print(f"N samples: {summary_json.get('n_samples', 'N/A')}")
+    print(f"Sanity mode: {summary_json.get('sanity_mode', 'N/A')}")
+    print()
+
+    # PRIMARY / SECONDARY classification note (A5 / A9)
+    note = summary_json.get("primary_metrics_note", "")
+    print("METRIC CLASSIFICATION:")
+    print(f"  PRIMARY metrics (directly comparable): accuracy, degradation, fld_cos, fld_l2")
+    print(f"  SECONDARY/EXPLORATORY metrics (NOT directly comparable across Grid 1 conditions,")
+    print(f"    because recovery-zone length = L - t varies when t varies):")
+    print(f"    RD_cos, RD_l2, BPD_mean, EBPD_mean, CKA, RSA")
+    print()
+    print(f"[primary_metrics_note]: {note}")
+    print()
+
+    _COL_FMT = f"{'Condition':<25} {'b':>3} {'t':>3} {'w':>3} {'Accuracy':>9} {'Degradation':>12} {'FLD_cos':>9} {'FLD_l2':>9}"
+    _DIV = "-" * len(_COL_FMT)
+
+    def _fmt_row(r: Dict) -> str:
+        def _s(v, w: int = 3) -> str:
+            return f"{v!s:>{w}}" if v not in (None, "", "None") else f"{'N/A':>{w}}"
+        def _f(v, w: int = 9, d: int = 4) -> str:
+            try:
+                return f"{float(v):{w}.{d}f}"
+            except (TypeError, ValueError):
+                return f"{'N/A':>{w}}"
+        return (
+            f"{r.get('condition',''):<25} {_s(r.get('b'))} {_s(r.get('t'))} "
+            f"{_s(r.get('width'))} {_f(r.get('accuracy'), 9, 4)} "
+            f"{_f(r.get('degradation'), 12, 4)} {_f(r.get('fld_cos'), 9, 6)} "
+            f"{_f(r.get('fld_l2'), 9, 4)}"
+        )
+
+    # Grid 1 table
+    print("-" * 70)
+    print("Grid 1: Position effect  (fixed width = 4)")
+    print("PRIMARY metrics — condition, b, t, width, accuracy, degradation, fld_cos, fld_l2")
+    print("-" * 70)
+    g1_rows = compute_phase_a_primary_table(run_data, "grid1")
+    if g1_rows:
+        print(_COL_FMT)
+        print(_DIV)
+        for r in g1_rows:
+            print(_fmt_row(r))
+    else:
+        print("  (no data — sanity run may have been limited to 1 non-baseline condition)")
+    print()
+
+    # Grid 2 table
+    print("-" * 70)
+    print("Grid 2: Width effect  (fixed boundary b = 8)")
+    print("PRIMARY metrics — condition, b, t, width, accuracy, degradation, fld_cos, fld_l2")
+    print("-" * 70)
+    g2_rows = compute_phase_a_primary_table(run_data, "grid2")
+    if g2_rows:
+        print(_COL_FMT)
+        print(_DIV)
+        for r in g2_rows:
+            print(_fmt_row(r))
+    else:
+        print("  (no data — sanity run may not include Grid 2 conditions)")
+    print()
+
+    # Random donor seeds verification note
+    rds = manifest.get("random_donor_seeds", {})
+    if rds:
+        print(f"Random donor seeds (A6): {len(rds)} condition(s) logged.")
+        for cname, cseed in sorted(rds.items()):
+            print(f"  {cname}: {cseed}")
+    print()
+
+    print("SECONDARY/EXPLORATORY metrics (not shown — comparability across Grid 1 conditions")
+    print("is compromised because recovery-zone length L - t differs when t varies):")
+    print("  RD_cos, RD_l2, BPD_mean, EBPD_mean, CKA, RSA")
+    print("  Use stage1.analysis.post_analysis.print_summary for Stage 1 (boundary-sweep) runs.")
+    print()
+
+
 # ─── CLI entry point ─────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Post-hoc BPD analysis for a completed Stage 1 run."
+        description="Post-hoc analysis for a completed Stage 1 or Phase A run."
     )
     parser.add_argument(
         "--run_dir",
         required=True,
         help="Path to the completed run directory (contains manifest.json, evaluation.json, etc.)",
+    )
+    parser.add_argument(
+        "--phase_a",
+        action="store_true",
+        help="Treat run_dir as a Phase A run and print primary two-grid tables.",
     )
     parser.add_argument(
         "--log_level",
@@ -801,7 +1138,10 @@ def main() -> None:
         level=getattr(logging, args.log_level),
         format="%(levelname)s %(name)s: %(message)s",
     )
-    print_summary(args.run_dir)
+    if args.phase_a:
+        print_phase_a_summary(args.run_dir)
+    else:
+        print_summary(args.run_dir)
 
 
 if __name__ == "__main__":

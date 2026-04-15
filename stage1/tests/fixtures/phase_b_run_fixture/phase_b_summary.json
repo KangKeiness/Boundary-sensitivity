@@ -1,0 +1,28 @@
+{
+  "phase": "B",
+  "description": "Synthetic Phase B fixture for Phase C tests",
+  "treatment_condition": "hard_swap_b8",
+  "reference_condition": "no_swap",
+  "t_fixed": 20,
+  "seed": 42,
+  "no_patch_accuracy": 0.125,
+  "clean_baseline_accuracy": 0.5,
+  "dataset": {
+    "name": "juletxara/mgsm",
+    "lang": "zh",
+    "split": "test",
+    "n_samples": 8
+  },
+  "environment": {
+    "torch_version": "synthetic",
+    "transformers_version": "synthetic",
+    "device": "cpu",
+    "git_sha": "synthetic-sha",
+    "seed": 42
+  },
+  "compose_meta": {
+    "b": 8,
+    "t": 20,
+    "condition": "hard_swap_b8"
+  }
+}
