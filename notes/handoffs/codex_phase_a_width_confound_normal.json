@@ -1,0 +1,21 @@
+{
+  "workflow": "new-experiment",
+  "slug": "phase_a_width_confound",
+  "stage": "5/6 codex-reviewer pass 1 (NORMAL)",
+  "verdict": "agree-pass",
+  "spec_ref": "notes/specs/phase_a_width_confound.md",
+  "writer_ref": "notes/handoffs/writer_phase_a_width_confound_r2.md",
+  "watcher_ref": "notes/handoffs/watcher_phase_a_width_confound.json",
+  "data_auditor_ref": "eval/reports/dataset_audit_phase_a_width_confound.json",
+  "findings": [
+    {"id": "CR-01", "severity": "medium", "label": "agree-nit", "file": "stage1/run_phase_a.py", "line": 424, "note": "_cond_rd_seed 'or 0' fallback is dead code; rd_seed stored in all_metadata for hard_swap conditions is semantically ambiguous but cannot affect outputs."},
+    {"id": "CR-02", "severity": "low", "label": "agree-nit", "file": "stage1/run_phase_a.py", "line": "148-151", "note": "Bootstrap hi_idx floor-truncation off-by-one at small n; not impactful at configured n_resamples=1000."},
+    {"id": "CR-03", "severity": "low", "label": "agree-nit", "file": "stage1/run_phase_a.py", "line": "155-196", "note": "_spearman_rho missing len(xs)==len(ys) guard; call sites provably safe."},
+    {"id": "CR-04", "severity": "low", "label": "disagree-with-reason", "file": "stage1/run_phase_a.py", "line": "336,353", "note": "save_hidden_states interface concern speculative; watcher PASS and 32 tests confirm interface correct."},
+    {"id": "CR-05", "severity": "nit", "label": "agree-nit", "file": "stage1/run_phase_a.py", "line": "482-488", "note": "except Exception on git_sha capture; standard defensive pattern."},
+    {"id": "CR-06", "severity": "nit", "label": "agree-nit", "file": "stage1/run_phase_a.py", "line": "457-458", "note": "NaN->None serialization for rho; correct."},
+    {"id": "CR-07", "severity": "nit", "label": "agree-nit", "file": "stage1/tests/test_compose_model_random_seed.py", "line": 127, "note": "Redundant tautological assertion; primary assertion at line 131 is authoritative."}
+  ],
+  "blocking_findings": [],
+  "next_stage": "codex-reviewer pass 2 (ADVERSARIAL)"
+}

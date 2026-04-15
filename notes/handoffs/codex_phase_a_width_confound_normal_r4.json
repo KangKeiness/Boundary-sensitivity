@@ -1,0 +1,29 @@
+{
+  "workflow": "new-experiment",
+  "slug": "phase_a_width_confound",
+  "stage": "codex-reviewer pass 1 (NORMAL) r4",
+  "verdict": "agree-pass",
+  "spec_ref": "notes/specs/phase_a_width_confound.md",
+  "writer_ref": "notes/handoffs/writer_phase_a_width_confound_r4.md",
+  "watcher_ref": "notes/handoffs/watcher_phase_a_width_confound.json",
+  "prior_codex_adversarial_r3_ref": "notes/handoffs/codex_phase_a_width_confound_adversarial_r3.json",
+  "av5_adv_block_addressed": true,
+  "findings": [
+    {"id": "N4-1", "label": "agree-pass", "note": "_check_grid_intersection is a true module-level def at stage1/run_phase_a.py:201; import resolves cleanly."},
+    {"id": "N4-2", "label": "agree-pass", "note": "All 4 test call sites match signature (rows, run_dir); no TypeError exposure."},
+    {"id": "N4-3", "label": "agree-pass", "note": "Helper uses os.path.join; compatible with tempfile tmp_path fixtures."},
+    {"id": "N4-4", "label": "agree-pass", "note": "Call site at line 773 is after A6 check and before ledger append; Tier 1 RuntimeError propagates correctly and lines 774-779 are unreachable on failure."},
+    {"id": "N4-5", "label": "agree-pass", "note": "No regression in any prior BLOCK/HIGH/MED/NIT finding."},
+    {"id": "N4-6", "label": "agree-pass", "note": "Forbidden files A13 byte-identity empty."},
+    {"id": "N4-7", "label": "agree-pass", "note": "Silent-skip branch at lines 209-212 preserved and covered by scenario (d) test."}
+  ],
+  "blocking_findings": [],
+  "carry_forward_nits": [
+    "AV1-ADV-LOW: non-atomic phase_a_summary.json write",
+    "AV2-ADV-LOW: bare except swallows FileNotFoundError",
+    "AV3-ADV-NIL: 1e-3 tolerance empirical confirmation deferred",
+    "AV7-ADV-NIL: no positive clean-pass key in summary JSON",
+    "Coordinator pre-full-run: HF revision pinning, mgsm_zh sha256"
+  ],
+  "next_stage": "codex-reviewer pass 2 (ADVERSARIAL) r4"
+}

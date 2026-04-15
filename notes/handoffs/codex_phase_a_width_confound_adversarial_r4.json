@@ -1,0 +1,26 @@
+{
+  "workflow": "new-experiment",
+  "slug": "phase_a_width_confound",
+  "stage": "codex-reviewer pass 2 (ADVERSARIAL) r4",
+  "verdict": "agree-pass",
+  "spec_ref": "notes/specs/phase_a_width_confound.md",
+  "writer_ref": "notes/handoffs/writer_phase_a_width_confound_r4.md",
+  "watcher_ref": "notes/handoffs/watcher_phase_a_width_confound.json",
+  "prior_codex_adversarial_ref": "notes/handoffs/codex_phase_a_width_confound_adversarial_r3.json",
+  "prior_codex_normal_r4_ref": "notes/handoffs/codex_phase_a_width_confound_normal_r4.json",
+  "av5_adv_block_resolution": "CONFIRMED CLOSED",
+  "blocking_findings": [],
+  "adversarial_targets": {
+    "T1_behavioral_equivalence": "agree-pass — no closures, no free variables",
+    "T2_name_error_at_call": "agree-pass — only stdlib and typing imports referenced",
+    "T3_hidden_globals": "agree-pass — tolerance literal, condition names literal, no module-level mutable state read",
+    "T4_conftest_torch_stub": "agree-nit — pre-existing gap (torch not stubbed); tests pass in datascience env; not new in r4",
+    "T5_silent_skip_scenario_d": "agree-pass — guard semantically identical to prior inline",
+    "T6_generator_iteration": "agree-pass — all call sites pass List[Dict]",
+    "T7_run_dir_missing_or_readonly": "agree-pass — except swallows; tmp_path always exists; pre-existing AV1/AV2 nits unchanged",
+    "T8_json_reopen_absent_file": "agree-pass — ordering preserved; tests pre-populate summary JSON for Tier 2 paths",
+    "T9_error_message_informativeness": "agree-pass — _strict_mismatch dict embedded; sufficient for diagnosis",
+    "T10_side_effect_ordering": "agree-pass — byte-identical to r3 inline"
+  },
+  "pipeline_disposition": "CLOSED — agree-pass on all ten adversarial targets. Pre-existing nits (AV1, AV2, AV3, AV7, torch stub gap) remain deferred. Pipeline may proceed to merge."
+}

@@ -1,0 +1,132 @@
+{
+  "verdict": "PASS",
+  "spec_ref": "notes/specs/phase_a_width_confound.md",
+  "writer_r4_ref": "notes/handoffs/writer_phase_a_width_confound_r4.md",
+  "prior_verdict_r3": "PASS",
+  "codex_adversarial_block_addressed": "AV5-ADV-BLOCK",
+  "tests_run": {
+    "command": "/c/Users/system1/anaconda3/envs/datascience/python.exe -m pytest stage1/tests/ -x -q",
+    "passed": 36,
+    "failed": 0,
+    "collected": 36,
+    "note": "Confirmed by watcher r4 execution. Count unchanged from r3."
+  },
+  "av5_adv_block_audit": {
+    "shadow_copy_deleted": true,
+    "evidence": "grep for _run_grid_intersection_check across stage1/ returns no matches",
+    "production_helper_extracted": true,
+    "helper_location": "stage1/run_phase_a.py:201 (module level, between _spearman_rho and Main runner section)",
+    "helper_signature": "_check_grid_intersection(rows: List[Dict], run_dir: str) -> None",
+    "test_import": "stage1/tests/test_grid_intersection_check.py:13 — from stage1.run_phase_a import _check_grid_intersection",
+    "test_call_sites": [50, 73, 102, 122],
+    "false_comment_corrected": true,
+    "new_comment_text": "Tests directly exercise the production _check_grid_intersection helper extracted from stage1.run_phase_a.",
+    "behavioral_identity_verified": true,
+    "behavioral_notes": {
+      "tier1_strict": "Lines 218-230: accuracy/degradation compared abs()>0; RuntimeError with 'logic bug' message — identical to prior inline block",
+      "tier2_relaxed": "Lines 233-266: fld_cos/fld_l2 at 1e-3 tolerance; SANITY WARNING printed; grid_intersection_fld_warning written into phase_a_summary.json; run continues — identical to prior inline block",
+      "silent_skip": "Lines 211-212: if not _intersection_conds.issubset(_run_conds): return — identical guard",
+      "tolerance_unchanged": "1e-3 at line 233"
+    },
+    "call_site_position": "line 773 — same logical position as prior inline block (after A6 formula check, before sanity-check ledger printout)",
+    "post_call_ledger_correct": true,
+    "post_call_ledger_note": "Lines 774-779 append True unconditionally; RuntimeError from Tier 1 propagates via exception so those lines are unreachable on failure — correct",
+    "fourth_test_replacement": {
+      "removed": "test_scenario_b_both_fld_metrics_in_warning",
+      "added": "test_scenario_d_only_one_condition_silent_skip",
+      "rationale_accepted": true,
+      "rationale": "Scenario (d) exercises the 'if not issubset: return' code path which was entirely untested in r3. The 'both fld metrics' sub-case does not introduce a new branch — the dict comprehension at lines 235-243 handles each key independently, making scenario (b) structurally equivalent. Replacement improves branch coverage while keeping total count at 36."
+    }
+  },
+  "spec_conformance": {
+    "matched": [
+      "AV5-ADV-BLOCK CLOSED: production _check_grid_intersection extracted to module level",
+      "Test file imports from stage1.run_phase_a — tests exercise production code, not a shadow copy",
+      "Tier 1 strict (accuracy/degradation): abs()>0; RuntimeError 'logic bug' — byte-equivalent to prior inline",
+      "Tier 2 relaxed (fld_cos/fld_l2): 1e-3 tolerance; warning written to phase_a_summary.json; no raise — byte-equivalent",
+      "Silent skip when not both fixed_w4_pos2 and fixed_b8_w4 present — unchanged",
+      "4 scenario tests: (a) no raise/no warning, (b) fld warning + payload structure, (c) accuracy raises RuntimeError, (d) one condition silent skip",
+      "36/36 tests pass — count unchanged from r3",
+      "Only 2 files changed: stage1/run_phase_a.py and stage1/tests/test_grid_intersection_check.py",
+      "Forbidden files byte-identical: git diff HEAD empty for all forbidden paths",
+      "No paper/, runs/, eval/ files modified",
+      "All prior PASS findings from r3 not regressed: BLOCK-1/2, HIGH-1/2/3, MED-1, NIT-1, AV-4"
+    ],
+    "missing": [],
+    "extra": []
+  },
+  "findings": [
+    {
+      "severity": "low",
+      "file": "stage1/run_phase_a.py",
+      "line": "774-775",
+      "category": "other",
+      "claim": "_run_conds set is recomputed after _check_grid_intersection call",
+      "evidence": "_check_grid_intersection already builds this set internally at line 210. Lines 774-775 rebuild it for the ledger append. Harmless duplication, not a bug.",
+      "suggested_fix": "Carry forward as nit; no correctness impact."
+    },
+    {
+      "severity": "low",
+      "file": "stage1/run_phase_a.py",
+      "line": "219-222",
+      "category": "correctness",
+      "claim": "Strict equality check operates on float accuracy/degradation rather than integer n_correct counts",
+      "evidence": "Carried forward from r3 PASS. abs(round(x,4) - round(y,4)) > 0 on floats is correct in practice because both conditions share an identical forward pass and baseline_acc. Comment says 'counts-based metrics' but implementation uses floats. Not a new regression.",
+      "suggested_fix": "Store n_correct in rows dict and compare integers directly for more robust semantics (deferred)."
+    },
+    {
+      "severity": "nit",
+      "file": "stage1/configs/stage2_confound.yaml",
+      "line": "7-8",
+      "category": "tokenizer",
+      "claim": "recipient_revision and donor_revision are 'main' (placeholder)",
+      "evidence": "Carried forward from r2/r3 PASS. Spec section 5 requires pinned HF revisions.",
+      "suggested_fix": "Coordinator replaces 'main' with exact HF commit SHAs before greenlighting 17-condition full run."
+    },
+    {
+      "severity": "nit",
+      "file": "notes/data_changelog.md",
+      "line": "14",
+      "category": "repro",
+      "claim": "mgsm_zh sha256 is pending",
+      "evidence": "Carried forward from r2/r3 PASS. Must be filled before full run per spec section 4.",
+      "suggested_fix": "Coordinator fills sha256 before greenlighting full run."
+    }
+  ],
+  "prior_pass_findings_regression_check": {
+    "BLOCK-1": "CLOSED, not regressed. HF revision loading in composer.py unchanged by r4.",
+    "BLOCK-2": "CLOSED, not regressed. save_hidden_states call path unchanged.",
+    "HIGH-1": "CLOSED, not regressed. git SHA wiring at run_phase_a.py line 551 unchanged.",
+    "HIGH-2": "CLOSED, not regressed. bootstrap/_spearman_rho helpers unchanged.",
+    "HIGH-3": "CLOSED (sha256 pending coordinator action), not regressed by r4.",
+    "MED-1": "CLOSED, not regressed. compose_model random seed: rng = random.Random(seed) at composer.py line 216 unchanged.",
+    "NIT-1": "CLOSED, not regressed.",
+    "AV-4": "CLOSED, not regressed. Two-tier check preserved with identical Tier 1/2 semantics in extracted helper."
+  },
+  "r4_scope_audit": {
+    "only_expected_files_changed": true,
+    "run_phase_a_py_changed": true,
+    "test_grid_intersection_check_py_changed": true,
+    "other_test_files_unchanged": true,
+    "composer_py_unchanged_by_r4": true,
+    "post_analysis_py_unchanged_by_r4": true,
+    "config_yaml_unchanged_by_r4": true,
+    "forbidden_files_unchanged": true,
+    "shadow_copy_eliminated": true
+  },
+  "reproducibility_checklist": {
+    "seed_wired": true,
+    "config_logged": true,
+    "run_name_required": true,
+    "determinism_flags": true,
+    "data_hash_recorded": false,
+    "data_hash_note": "sha256 pending in data_changelog.md; unchanged from r2/r3 PASS; must be filled before full run"
+  },
+  "must_fix_before_merge": [],
+  "can_ship_with_followup": [
+    "Extract _run_conds recomputation at lines 774-775 (minor duplication with _check_grid_intersection internal set)",
+    "Use integer n_correct comparison in strict check for cleaner counts-based semantics (low finding, carried from r3)",
+    "Pin recipient_revision and donor_revision to exact HF SHAs before full run (spec section 5)",
+    "Fill mgsm_zh sha256 in data_changelog.md before full run (spec section 4)"
+  ]
+}

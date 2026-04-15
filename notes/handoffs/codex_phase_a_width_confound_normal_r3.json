@@ -1,0 +1,52 @@
+{
+  "workflow": "new-experiment",
+  "slug": "phase_a_width_confound",
+  "stage": "codex-reviewer pass 1 (NORMAL) r3",
+  "verdict": "agree-pass",
+  "spec_ref": "notes/specs/phase_a_width_confound.md",
+  "writer_r3_ref": "notes/handoffs/writer_phase_a_width_confound_r3.md",
+  "watcher_ref": "notes/handoffs/watcher_phase_a_width_confound.json",
+  "prior_codex_adversarial_ref": "notes/handoffs/codex_phase_a_width_confound_adversarial.json",
+  "prior_codex_normal_ref": "notes/handoffs/codex_phase_a_width_confound_normal.json",
+  "av4_addressed": true,
+  "scope_respected": true,
+  "findings": [
+    {
+      "id": "R3-N-1",
+      "severity": "nit",
+      "label": "agree-nit",
+      "file": "stage1/tests/test_grid_intersection_check.py",
+      "line": "22-23",
+      "category": "test-documentation",
+      "claim": "Comment asserts the inline helper will catch production drift; claim is false because tests exercise the inline copy, not the production function.",
+      "blocking": false
+    },
+    {
+      "id": "R3-N-2",
+      "severity": "nit",
+      "label": "agree-nit",
+      "file": "stage1/run_phase_a.py",
+      "line": "519-520 vs 756",
+      "category": "encoding-consistency",
+      "claim": "Initial phase_a_summary.json write uses platform default encoding; re-open uses explicit utf-8. Pre-existing, not introduced by r3.",
+      "blocking": false
+    },
+    {
+      "id": "R3-N-3",
+      "severity": "nit",
+      "label": "agree-nit",
+      "file": "stage1/run_phase_a.py",
+      "line": "704-705",
+      "category": "documentation-clarity",
+      "claim": "'Counts-based' label is imprecise — comparison operates on round(n_correct/250, 4) floats, equivalent to integer count comparison at n_total=250 but mislabeled.",
+      "blocking": false
+    }
+  ],
+  "blocking_findings": [],
+  "must_fix_before_merge": [],
+  "can_ship_with_followup": [
+    "R3-N-1, R3-N-2, R3-N-3 (all nit)",
+    "Inherited from r2: pin HF revisions, fill mgsm_zh sha256 before full run"
+  ],
+  "next_stage": "codex-reviewer pass 2 (ADVERSARIAL) on r3"
+}

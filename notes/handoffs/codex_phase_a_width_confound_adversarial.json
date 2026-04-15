@@ -1,0 +1,43 @@
+{
+  "workflow": "new-experiment",
+  "slug": "phase_a_width_confound",
+  "stage": "6/6 codex-reviewer pass 2 (ADVERSARIAL)",
+  "verdict": "agree-block",
+  "spec_ref": "notes/specs/phase_a_width_confound.md",
+  "writer_ref": "notes/handoffs/writer_phase_a_width_confound_r2.md",
+  "watcher_ref": "notes/handoffs/watcher_phase_a_width_confound.json",
+  "prior_codex_ref": "notes/handoffs/codex_phase_a_width_confound_normal.json",
+  "blocking_findings": [
+    {
+      "id": "AV-4",
+      "severity": "medium-blocking",
+      "file": "stage1/run_phase_a.py",
+      "line": "700-723",
+      "category": "repro",
+      "claim": "Grid-intersection self-consistency check uses a hard 1e-6 tolerance on fld_cos/fld_l2 between fixed_w4_pos2 and fixed_b8_w4 (identical design point b=8,t=12), and raises RuntimeError if exceeded.",
+      "evidence": "run_phase_a does not set torch.use_deterministic_algorithms(True) nor torch.backends.cudnn.deterministic=True. Qwen2.5 uses flash-attention2 which is not bitwise reproducible across separate calls on GPU. The two conditions run in different loop iterations separated by gc.collect() and cuda.empty_cache(), altering memory layout and potentially triggering different kernel paths. On GPU hardware the check will spuriously fire and abort an otherwise valid 6-GPU-hour full run with no recovery path other than a code edit.",
+      "suggested_fix": "Option A (preferred): Compare accuracy and degradation at strict equality (they are counts-based and fully deterministic under greedy decoding), and compare fld_cos/fld_l2 at a relaxed tolerance of 1e-3 OR convert them to log-only warnings. Option B: Force deterministic mode at run start (torch.use_deterministic_algorithms(True), torch.backends.cudnn.deterministic=True, env CUBLAS_WORKSPACE_CONFIG=:4096:8). Option A is preferred because it does not impose a global deterministic-mode constraint that can slow down flash-attention2."
+    }
+  ],
+  "non_blocking_findings": [
+    {"id": "AV-8", "severity": "nit", "note": "A10 grep scope: current code checks only phase_a_summary.txt/.json; spec mentions 'any .md artifact the writer produces' but no .md is written in run_dir. Theoretical gap only."},
+    {"id": "AV-10", "severity": "low", "note": "revision='main' resolves to rolling HEAD at download time; manifest does not capture the resolved HF commit SHA. Already known, deferred to pre-full-run gate."},
+    {"id": "AV-11", "severity": "nit", "note": "Confirms CR-01: `or 0` bootstrap seed fallback is dead code."},
+    {"id": "AV-17", "severity": "low", "note": "compute_fld uses sorted(set(hs_recipient) & set(hs_composed)) — if run_inference silently drops samples asymmetrically across conditions, FLD diverges from accuracy sample set without warning. Pre-existing run_inference interface limitation, not a Phase A regression."}
+  ],
+  "all_attack_vectors_pass": [
+    "AV-1 bootstrap reproducibility",
+    "AV-2 spearman n=4 ties (widths distinct by construction)",
+    "AV-3 FLD float32 cast on both tensors",
+    "AV-5 self-consistency check skipped correctly in sanity mode",
+    "AV-6 random_donor_seeds dict keyed by condition name preserves collision",
+    "AV-7 git SHA works in detached HEAD / shallow clone",
+    "AV-9 no MGSM-zh split leakage via cached parser state",
+    "AV-12 zip truncation cannot occur (lists always len(samples))",
+    "AV-13 hs_no_swap memory within budget",
+    "AV-14 A3 sanity CSV row count = 1 correct",
+    "AV-15 scipy spearmanr attribute fallback correct",
+    "AV-16 grid1/grid2 row filtering at intersection correct"
+  ],
+  "routing": "Per CLAUDE.md: Codex agree-block always wins. Pipeline halts. Route AV-4 back to writer for r3. No other findings require code changes."
+}

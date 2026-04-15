@@ -1,0 +1,169 @@
+{
+  "slug": "phase_a_width_confound",
+  "generated_at": "2026-04-12T00:00:00Z",
+  "auditor": "claude-sonnet-4-6 / dataset-audit skill",
+  "workflow": "new-experiment",
+  "stage": "4/6",
+  "verdict": "WARN",
+  "block_training": false,
+  "changelog_synced": true,
+  "datasets": [
+    {
+      "name": "mgsm",
+      "version": "v1.0-2022-10-03 (juletxara/mgsm, language=zh, split=test)",
+      "hash": "sha256:pending — coordinator must compute over raw zh TSV/JSONL before greenlighting full 17-condition run",
+      "row_counts": {"train": 0, "dev": 0, "test": 250},
+      "per_language": {"zh": 250},
+      "leakage": {
+        "train_test_overlap": 0.0,
+        "note": "Phase A is inference-only; no training set used. MGSM-zh test split was already consumed by Stage 1 (same split, no reshuffling). No new split reuse. Transfer leakage does not apply."
+      },
+      "oov_rate": {},
+      "truncation_risk": {
+        "pct_over_max_len": null,
+        "note": "max_new_tokens=512 governs generation output length only, not input encoding. Cannot compute without a live run. Deferred to post-run check."
+      },
+      "findings": [
+        {
+          "id": "F1",
+          "severity": "WARN",
+          "block": false,
+          "category": "changelog_sha256_pending",
+          "description": "notes/data_changelog.md now contains a dated mgsm_zh@v1.0-2022-10-03 entry (added in writer r2, 2026-04-11). The entry has correct shape: dataset name, version, HuggingFace source (juletxara/mgsm, language=zh, split=test), row_count=250, license=CC-BY-SA 4.0, reason, author. The sha256 field is present but set to 'pending' with an inline TODO noting that the coordinator must compute it before greenlighting the full 17-condition run. The entry shape is valid; the pending hash is a pre-full-run gate, not a pre-merge gate. F1 from the prior WARN audit is STRUCTURALLY CLOSED; the deferred gate remains.",
+          "recommendation": "Coordinator must compute sha256 over the raw zh TSV/JSONL (or HuggingFace cached parquet) and replace the 'pending' value in notes/data_changelog.md before issuing the full-run greenlight. This is not a blocker for merge or unit-test runs."
+        },
+        {
+          "id": "F2",
+          "severity": "WARN",
+          "block": false,
+          "category": "seed_collision_acknowledged",
+          "description": "The seed formula seed_base*1000 + b*100 + t produces only 7 distinct values across 8 random conditions. The collision is between random_fixed_w4_pos2 (b=8, t=12, seed=42812) and random_fixed_b8_w4 (b=8, t=12, seed=42812). This is a grid-design collision, not a formula bug: both conditions are defined as the same design point (b=8, t=12) per spec §4.1 / Addendum B. run_phase_a.py now explicitly acknowledges this by: (1) recording grid_intersection_notes = {'(8,12)': ['fixed_w4_pos2', 'fixed_b8_w4']} in manifest.json and phase_a_summary.json; (2) recording grid_intersection_shared_seed=42812 in both artifacts; (3) adding a one-line note to phase_a_summary.txt stating the two conditions share (b=8,t=12) by construction; (4) raising RuntimeError if both conditions are present but their hard-swap primary metrics differ by more than 1e-6. The 8 random_* conditions produce 7 distinct seeds — this is expected and explicitly documented per Addendum B. A6 check (len==8, distinct==7, collision=random_fixed_w4_pos2 and random_fixed_b8_w4) is satisfied by construction. F2 from the prior WARN audit is CLOSED with explicit acknowledgement.",
+          "seeds_computed": {
+            "random_fixed_w4_pos1": 42408,
+            "random_fixed_w4_pos2": 42812,
+            "random_fixed_w4_pos3": 43216,
+            "random_fixed_w4_pos4": 43620,
+            "random_fixed_b8_w2":   42810,
+            "random_fixed_b8_w4":   42812,
+            "random_fixed_b8_w6":   42814,
+            "random_fixed_b8_w8":   42816
+          },
+          "distinct_seeds": 7,
+          "collision_pair": ["random_fixed_w4_pos2", "random_fixed_b8_w4"],
+          "addendum_b_a6_check": {
+            "len_random_donor_seeds_eq_8": true,
+            "distinct_seeds_eq_7": true,
+            "collision_is_expected_pair": true
+          }
+        },
+        {
+          "id": "F3",
+          "severity": "WARN",
+          "block": false,
+          "category": "model_revision_unpinned",
+          "description": "stage1/configs/stage2_confound.yaml now contains recipient_revision: 'main' and donor_revision: 'main' (added in writer r2 as explicit placeholders; stage1/utils/config.py ModelsConfig extended with Optional[str] fields). The revision field is present but not pinned to a commit SHA. Spec §5 requires pinned HF revisions for full-run reproducibility. The value 'main' is a mutable ref and will silently resolve to a different checkpoint if the upstream model is updated between the sanity run and the full run. This is noted as a TODO in stage2_confound.yaml. It is a pre-full-run gate, not a pre-merge gate.",
+          "recommendation": "Coordinator must replace 'main' with pinned commit SHAs for both Qwen/Qwen2.5-1.5B-Instruct and Qwen/Qwen2.5-1.5B before issuing the full-run greenlight. Consider adding hashes to notes/data_changelog.md alongside the mgsm_zh sha256 entry."
+        },
+        {
+          "id": "F4",
+          "severity": "INFO",
+          "block": false,
+          "category": "d1_seed_formula_fixed",
+          "description": "composer.py compose_model line 216: rng = random.Random(seed). The caller-owns-formula pattern is correctly implemented. D1 double-seed bug is confirmed fixed. Caller (run_phase_a.py) computes rd_seed = compute_random_donor_seed(seed_base, b, t) and passes it verbatim to get_condition_model, which passes it verbatim to compose_model as 'seed'. No further arithmetic inside compose_model."
+        },
+        {
+          "id": "F5",
+          "severity": "INFO",
+          "block": false,
+          "category": "d6_no_swap_seed_correct",
+          "description": "run_phase_a.py lines 282-285: rd_seed is set to None for no_swap (b is None and t is None). all_metadata[cond_name]['rd_seed'] stores None for no_swap. random_donor_seeds dict only records entries where cond_key == 'random_donor' and rd_seed is not None (line 367-368). No misleading seed stored for no_swap. D6 is confirmed fixed."
+        },
+        {
+          "id": "F6",
+          "severity": "INFO",
+          "block": false,
+          "category": "d11_sanity_check_tightened",
+          "description": "run_phase_a.py lines 681-687: missing_seeds check iterates only cond_name.startswith('random_'). No demand for rd_seed on no_swap or hard_swap conditions. D11 is confirmed fixed."
+        },
+        {
+          "id": "F7",
+          "severity": "INFO",
+          "block": false,
+          "category": "dataset_config_zh_confirmed",
+          "description": "stage1/configs/stage2_confound.yaml dataset block: name=mgsm, lang=zh, split=test, debug_n=null. Matches spec §4 and §9 requirements exactly. Language coverage is zh-only for Phase A. No cross-language leakage."
+        },
+        {
+          "id": "F8",
+          "severity": "INFO",
+          "block": false,
+          "category": "generation_invariants_confirmed",
+          "description": "stage2_confound.yaml generation block: {do_sample: false, temperature: 0.0, max_new_tokens: 512}. Satisfies A1. Config key is 'seed' (not seed_base), matching RandomDonorConfig dataclass. D2 yaml field name bug is confirmed fixed."
+        },
+        {
+          "id": "F9",
+          "severity": "INFO",
+          "block": false,
+          "category": "boundary_grid_present",
+          "description": "stage2_confound.yaml has boundary_grid: [8]. Stage1Config.validate() will not raise. Phase A grid iteration comes from build_phase_a_conditions, not from this key. D3 is confirmed fixed."
+        },
+        {
+          "id": "F10",
+          "severity": "INFO",
+          "block": false,
+          "category": "sanity_mode_condition_count",
+          "description": "build_phase_a_conditions(sanity=True) returns exactly [('no_swap', None, None), ('fixed_w4_pos2', 8, 12)] — 2 conditions. Matches spec §4.4.D and A3. D4 is confirmed fixed."
+        },
+        {
+          "id": "F11",
+          "severity": "INFO",
+          "block": false,
+          "category": "absolute_imports",
+          "description": "run_phase_a.py uses absolute imports: from stage1.utils.config, from stage1.data.loader, from stage1.models.composer, from stage1.inference.runner, etc. Invocation via python -m stage1.run_phase_a. D5 is confirmed fixed."
+        },
+        {
+          "id": "F12",
+          "severity": "INFO",
+          "block": false,
+          "category": "grid_intersection_self_consistency_check",
+          "description": "run_phase_a.py lines 700-723: if both fixed_w4_pos2 and fixed_b8_w4 appear in the run, the check compares accuracy, degradation, fld_cos, fld_l2 to within 1e-6 and raises RuntimeError on mismatch. The collision is explicitly recorded in manifest.json (grid_intersection_notes, grid_intersection_shared_seed=42812) and phase_a_summary.json. phase_a_summary.txt contains the one-line note: 'Note: fixed_w4_pos2 and fixed_b8_w4 share design point (b=8,t=12) by grid construction — their hard-swap primary metrics should be identical (self-consistency check) and their random-donor draws share seed 42812.' The collision is acknowledged, not silenced. F2 / Addendum B writer responsibilities are all satisfied."
+        },
+        {
+          "id": "F13",
+          "severity": "INFO",
+          "block": false,
+          "category": "primary_secondary_metric_classification",
+          "description": "phase_a_summary.json primary_metrics_note contains both substrings 'PRIMARY' and 'SECONDARY' and names all four primary metrics (accuracy, degradation, fld_cos, fld_l2). phase_a_summary.txt contains the METRIC COMPARABILITY NOTE section with explicit PRIMARY and SECONDARY/EXPLORATORY headers. Recovery-zone mean metrics (RD_cos, RD_l2, BPD_mean, EBPD_mean, CKA, RSA) are listed as SECONDARY and flagged as 'NOT directly comparable across Grid 1 conditions'. A5, A9 requirements met in code."
+        },
+        {
+          "id": "F14",
+          "severity": "INFO",
+          "block": false,
+          "category": "conservative_wording_gate",
+          "description": "run_phase_a.py lines 636-660: forbidden phrases ['proves the mechanism', 'causal proof', 'identifies the true cause', 'fully explains'] are checked in phase_a_summary.txt and phase_a_summary.json at run time; RuntimeError raised on any match. D9 / A10 confirmed implemented."
+        },
+        {
+          "id": "F15",
+          "severity": "INFO",
+          "block": false,
+          "category": "leakage_no_split_reshuffling",
+          "description": "MGSM-zh test split was already used by Stage 1. Phase A is inference-only on the same test split with no dataset download, no split reshuffling, and no train/dev set involved. Eval contamination does not apply (no training). No new leakage introduced."
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "blocking_findings": 0,
+    "warn_findings": 3,
+    "info_findings": 12,
+    "warn_detail": {
+      "F1_sha256_pending": "mgsm_zh changelog entry exists with correct shape; sha256 field is 'pending' — must be filled by coordinator before full-run greenlight. Not a merge blocker.",
+      "F2_seed_collision_acknowledged": "7 distinct seeds across 8 random conditions; collision between random_fixed_w4_pos2 and random_fixed_b8_w4 (both b=8,t=12) is intentional per Addendum B, explicitly recorded in manifest + summary, and guarded by self-consistency RuntimeError check. A6 amended constraint (len==8, distinct==7, expected collision pair) satisfied.",
+      "F3_model_revision_unpinned": "recipient_revision and donor_revision both set to 'main' — mutable ref; must be pinned to commit SHAs before full-run greenlight. Not a merge blocker."
+    },
+    "pre_merge_gates": "NONE — no structural integrity problems found.",
+    "pre_full_run_gates": [
+      "Fill sha256 in notes/data_changelog.md mgsm_zh@v1.0-2022-10-03 entry (F1)",
+      "Replace recipient_revision and donor_revision 'main' placeholders in stage2_confound.yaml with pinned HF commit SHAs (F3)"
+    ]
+  }
+}

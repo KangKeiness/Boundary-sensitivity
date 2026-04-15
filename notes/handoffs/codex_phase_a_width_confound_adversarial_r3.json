@@ -1,0 +1,29 @@
+{
+  "workflow": "new-experiment",
+  "slug": "phase_a_width_confound",
+  "stage": "codex-reviewer pass 2 (ADVERSARIAL) r3",
+  "verdict": "agree-block",
+  "spec_ref": "notes/specs/phase_a_width_confound.md",
+  "writer_ref": "notes/handoffs/writer_phase_a_width_confound_r3.md",
+  "watcher_ref": "notes/handoffs/watcher_phase_a_width_confound.json",
+  "prior_codex_adversarial_ref": "notes/handoffs/codex_phase_a_width_confound_adversarial.json",
+  "prior_codex_normal_r3_ref": "notes/handoffs/codex_phase_a_width_confound_normal_r3.json",
+  "blocking_findings": [
+    {
+      "id": "AV5-ADV-BLOCK",
+      "severity": "agree-block",
+      "file": "stage1/tests/test_grid_intersection_check.py",
+      "line": "9-10, 25-85",
+      "category": "test-coverage",
+      "claim": "Test comment at lines 9-10 asserts the tests catch production code drift. Test file does not import from stage1.run_phase_a. All four tests call an inline shadow copy _run_grid_intersection_check (lines 25-85), not the production code at run_phase_a.py:702-770. CI will remain green after any production code change; the false-assurance comment misleads future contributors.",
+      "required_fix": "Extract the grid-intersection check from run_phase_a.py:702-770 into a module-level helper function (e.g., _check_grid_intersection(rows, run_dir) or similar). Import it from run_phase_a in both the production call site and the test file. Delete _run_grid_intersection_check from test file. Correct or remove the false comment at lines 9-10. No behavior change; no spec deviation; no new files required."
+    }
+  ],
+  "non_blocking_findings": [
+    {"id": "AV1-ADV-LOW", "severity": "low", "file": "stage1/run_phase_a.py", "line": "763-764", "note": "Non-atomic write to phase_a_summary.json in Tier 2 path (open-w truncates before json.dump completes); SIGKILL leaves empty file. Primary CSVs and manifest unaffected. Fix with tmp+os.replace if desired."},
+    {"id": "AV2-ADV-LOW", "severity": "low", "file": "stage1/run_phase_a.py", "line": "765-766", "note": "except Exception swallows FileNotFoundError if phase_a_summary.json missing; warning lost silently. Backstopped by sanity-check RuntimeError at line 780-781."},
+    {"id": "AV3-ADV-NIL", "severity": "nit", "note": "1e-3 tolerance is ~10x headroom over analytical flash-attn2 deviation (~1e-4 mean over 250 fp32 samples). Defensible; 5e-3 would be more conservative. Empirical confirmation recommended before full run."},
+    {"id": "AV7-ADV-NIL", "severity": "nit", "note": "No positive clean-pass key in phase_a_summary.json; absence of grid_intersection_fld_warning ambiguates clean-pass from skipped."}
+  ],
+  "routing": "Codex agree-block always wins per CLAUDE.md. Pipeline halts. Route AV5-ADV-BLOCK to writer for r4. Scope: extract production helper + fix test imports + remove false comment only."
+}

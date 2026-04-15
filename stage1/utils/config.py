@@ -20,6 +20,8 @@ def setup_logging(level: int = logging.INFO) -> None:
 class ModelsConfig:
     recipient: str
     donor: str
+    recipient_revision: Optional[str] = None
+    donor_revision: Optional[str] = None
 
 
 @dataclass

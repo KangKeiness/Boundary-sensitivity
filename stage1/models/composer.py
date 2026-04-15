@@ -8,28 +8,125 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+# ─── Condition → (b, t) parser ──────────────────────────────────────────────
+
+# Phase A grid definitions (fixed width / fixed boundary)
+FIXED_W4_GRID = {
+    "fixed_w4_pos1": (4, 8),
+    "fixed_w4_pos2": (8, 12),
+    "fixed_w4_pos3": (12, 16),
+    "fixed_w4_pos4": (16, 20),
+}
+FIXED_B8_GRID = {
+    "fixed_b8_w2": (8, 10),
+    "fixed_b8_w4": (8, 12),
+    "fixed_b8_w6": (8, 14),
+    "fixed_b8_w8": (8, 16),
+}
+RANDOM_FIXED_W4_GRID = {
+    f"random_{k}": v for k, v in FIXED_W4_GRID.items()
+}
+RANDOM_FIXED_B8_GRID = {
+    f"random_{k}": v for k, v in FIXED_B8_GRID.items()
+}
+
+# Unified lookup for all Phase A grid conditions
+PHASE_A_GRID = {
+    **FIXED_W4_GRID,
+    **FIXED_B8_GRID,
+    **RANDOM_FIXED_W4_GRID,
+    **RANDOM_FIXED_B8_GRID,
+}
+
+
+def parse_condition_bt(condition_name: str, config=None) -> Tuple[str, Optional[int], Optional[int]]:
+    """
+    Parse a condition name into (internal_condition_key, b, t).
+
+    Supports:
+      - no_swap
+      - hard_swap_b{X}          → ("hard_swap", X, config.t_fixed)
+      - random_donor_b{X}       → ("random_donor", X, config.t_fixed)
+      - fixed_w4_pos{N}         → ("hard_swap", b, t) from grid
+      - fixed_b8_w{W}           → ("hard_swap", b, t) from grid
+      - random_fixed_w4_pos{N}  → ("random_donor", b, t) from grid
+      - random_fixed_b8_w{W}    → ("random_donor", b, t) from grid
+
+    Args:
+        condition_name: The full condition name string.
+        config: Stage1Config or similar object with t_fixed attribute.
+                Required for hard_swap_b{X} / random_donor_b{X} forms.
+
+    Returns:
+        (cond_key, b, t) where cond_key is one of "no_swap", "hard_swap", "random_donor".
+    """
+    if condition_name == "no_swap":
+        return ("no_swap", None, None)
+
+    # Phase A grid conditions
+    if condition_name in PHASE_A_GRID:
+        b, t = PHASE_A_GRID[condition_name]
+        if condition_name.startswith("random_"):
+            return ("random_donor", b, t)
+        else:
+            return ("hard_swap", b, t)
+
+    # Stage 1 style: hard_swap_b{X}
+    if condition_name.startswith("hard_swap_b"):
+        b = int(condition_name.split("_b")[-1])
+        t_fixed = config.t_fixed if config is not None else None
+        if t_fixed is None:
+            raise ValueError(f"config.t_fixed required for condition {condition_name}")
+        return ("hard_swap", b, t_fixed)
+
+    # Stage 1 style: random_donor_b{X}
+    if condition_name.startswith("random_donor_b"):
+        b = int(condition_name.split("_b")[-1])
+        t_fixed = config.t_fixed if config is not None else None
+        if t_fixed is None:
+            raise ValueError(f"config.t_fixed required for condition {condition_name}")
+        return ("random_donor", b, t_fixed)
+
+    raise ValueError(f"Cannot parse condition name: {condition_name!r}")
+
+
 def load_models(
     recipient_name: str,
     donor_name: str,
     device: str = "auto",
     dtype: torch.dtype = torch.float16,
+    recipient_revision: Optional[str] = None,
+    donor_revision: Optional[str] = None,
 ) -> Tuple[AutoModelForCausalLM, AutoModelForCausalLM, AutoTokenizer]:
-    """Load recipient and donor models plus the recipient tokenizer."""
+    """Load recipient and donor models plus the recipient tokenizer.
+
+    Args:
+        recipient_name: HF model name or path for the recipient (instruct) model.
+        donor_name: HF model name or path for the donor (base) model.
+        device: Device map passed to from_pretrained.
+        dtype: Weight dtype.
+        recipient_revision: HF revision (commit SHA / branch / tag) for recipient.
+                            None means HF default ("main").
+        donor_revision: HF revision for donor. None means HF default ("main").
+    """
     recipient = AutoModelForCausalLM.from_pretrained(
         recipient_name,
         torch_dtype=dtype,
         device_map=device,
         trust_remote_code=True,
+        revision=recipient_revision,
     )
     donor = AutoModelForCausalLM.from_pretrained(
         donor_name,
         torch_dtype=dtype,
         device_map=device,
         trust_remote_code=True,
+        revision=donor_revision,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         recipient_name,
         trust_remote_code=True,
+        revision=recipient_revision,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -116,10 +213,12 @@ def compose_model(
         # source_start is randomly sampled but fixed by seed for reproducibility.
         block_width = t - b
         max_start = num_layers - block_width
-        rng = random.Random(seed * 1000 + b)
+        rng = random.Random(seed)  # D1: caller already encodes the full formula; use verbatim
         source_start = rng.randint(0, max_start)
         metadata["source_start"] = source_start
         metadata["seed"] = seed
+        metadata["b"] = b
+        metadata["t"] = t
         for i in range(block_width):
             composed_layers[b + i].load_state_dict(
                 donor_layers[source_start + i].state_dict()
@@ -180,3 +279,8 @@ def get_condition_model(
         return compose_model(recipient, donor, b, t, condition="random_donor", seed=random_donor_seed)
 
     raise ValueError(f"Unknown condition: {condition!r}")
+
+
+def compute_random_donor_seed(seed_base: int, b: int, t: int) -> int:
+    """Deterministic seed for random donor conditions: seed_base*1000 + b*100 + t."""
+    return seed_base * 1000 + b * 100 + t

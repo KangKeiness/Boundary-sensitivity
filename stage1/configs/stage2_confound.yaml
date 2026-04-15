@@ -1,0 +1,57 @@
+# Phase A - Width Confound Separation Grid
+# Separates boundary-position effects from swap-width effects.
+
+models:
+  recipient: "Qwen/Qwen2.5-1.5B-Instruct"
+  donor: "Qwen/Qwen2.5-1.5B"
+  recipient_revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"   # Qwen/Qwen2.5-1.5B-Instruct pinned SHA
+  donor_revision: "8faed761d45a263340a0528343f099c05c9a4323"       # Qwen/Qwen2.5-1.5B pinned SHA
+
+# boundary_grid must be non-empty for Stage1Config.validate(); Phase A iteration
+# comes from build_phase_a_conditions, not from this grid.
+boundary_grid: [8]
+
+# Explicit Phase A grid (also defined in composer.PHASE_A_GRID — code grid is
+# checked against this YAML grid at startup to catch drift).
+phase_a_grid:
+  fixed_w4:
+    fixed_w4_pos1: {b: 4,  t: 8}
+    fixed_w4_pos2: {b: 8,  t: 12}
+    fixed_w4_pos3: {b: 12, t: 16}
+    fixed_w4_pos4: {b: 16, t: 20}
+  fixed_b8:
+    fixed_b8_w2: {b: 8, t: 10}
+    fixed_b8_w4: {b: 8, t: 12}
+    fixed_b8_w6: {b: 8, t: 14}
+    fixed_b8_w8: {b: 8, t: 16}
+
+# Kept for backward-compat with Stage 1 code paths that read t_fixed.
+# Phase A conditions define their own (b, t) pairs.
+t_fixed: 20
+
+reference:
+  b_ref: 8
+  t_ref: 20
+
+hidden_state:
+  pooling: "last_token"
+
+random_donor:
+  mode: "same_width_random_source"
+  seed: 42        # Phase A seed rule: seed*1000 + b*100 + t  (D2: was seed_base, renamed to seed)
+
+dataset:
+  name: "mgsm"
+  lang: "zh"
+  split: "test"
+  debug_n: null         # set integer for sanity mode (e.g. 5)
+
+generation:
+  do_sample: false
+  temperature: 0.0
+  max_new_tokens: 512   # spec says 512
+
+evaluation:
+  bootstrap_n: 1000
+  bootstrap_ci: 0.95
+  criteria_threshold: 2
