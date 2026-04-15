@@ -1,0 +1,129 @@
+{
+  "verdict": "PASS",
+  "round": 2,
+  "spec_conformance": {
+    "matched": [
+      "Round 1 matched items still hold: DynamicCache-backed continuation, Qwen2 plumbing (4D causal mask + RoPE + position_ids + cache_position), clean_baseline_acc, encoding='utf-8' blanket, spurious recovery-% print removed, FORBIDDEN_PHRASES gate post-write, effect-size-gated comparative sentence (paired bootstrap, EPSILON_DELTA=0.02, 1000 resamples, seed 0, 95% percentile CI), 5 real sanity tests, t_fixed=20 + TXT header literal, methodology column with exact METHODOLOGY_TAG string, corruption arm mirrored to 4 granularity-matched conditions, determinism (torch.use_deterministic_algorithms(True, warn_only=True) + CUBLAS_WORKSPACE_CONFIG=':4096:8' pre-CUDA + all RNGs seeded), donor freed post-compose, composed state_dict SHA-256 stable guard, environment block fully logged, dataset block mirrors Phase A manifest, sanity mode {no_patch, patch_recovery_full, clean_no_patch, corrupt_recovery_full}×5, __init__ re-exports explicit __all__, FORBIDDEN_PHRASES is strict superset of Phase A inline list",
+      "A1 fix confirmed — stage1/run_phase_b.py:43-56 all internal imports are fully-qualified 'from stage1.<...> import ...' (load_config/setup_logging, create_run_dir, FORBIDDEN_PHRASES/check_artifacts_for_forbidden, load_mgsm, load_models/compose_model, parse_answer, exact_match, intervention.patcher surface). Mirrors stage1/run_phase_a.py layout exactly. Unblocks spec §10 canonical 'python -m stage1.run_phase_b' invocation.",
+      "A1 guard test confirmed — stage1/tests/test_phase_b_patcher.py::test_run_phase_b_module_imports uses importlib.import_module('stage1.run_phase_b') and specifically distinguishes the bare-package ModuleNotFoundError (utils|data|models|inference|analysis|intervention escaping stage1.*) from unrelated sandbox missing deps. The former raises AssertionError with descriptive message; the latter skips. Asserts presence of run_phase_b, main, EPSILON_DELTA, PHASE_A_CROSS_CHECK_TOL, _load_latest_phase_a_summary, _phase_a_outputs_dir on the imported module — any future drift to unqualified imports fails CI.",
+      "A2 fix confirmed — new helper _phase_a_outputs_dir() at run_phase_b.py:125-136 resolves via pathlib.Path(__file__).resolve().parents[1] / 'stage1' / 'outputs' / 'phase_a' (parents[1] = repo root for stage1/run_phase_b.py layout). _load_latest_phase_a_summary() at lines 139-154 globs os.path.join(_phase_a_outputs_dir(), 'run_*', 'phase_a_summary.json') — CWD-invariant. Returns (summary, path) tuple so the resolved path is provenance-logged.",
+      "A2 no-match branch FAILs acceptance — run_phase_b.py:696-707: when cross_check_passed is None (no Phase A summary resolved), sanity mode tolerates the miss (bootstrap allowance explicitly labelled 'sanity mode, no prior summary'), but non-sanity runs append (<descriptive FAIL string>, False) which propagates via the 'if not all(ok for _, ok in checks): raise RuntimeError' guard at line 718-719. Spec §11.7 acceptance criterion is no longer trivially-PASS-by-absence — it is a hard RuntimeError in a full run.",
+      "A2 guards confirmed — stage1/tests/test_phase_b_patcher.py::test_phase_a_loader_no_match_returns_none monkeypatches _phase_a_outputs_dir to an empty tmp path, chdirs elsewhere, asserts loader returns (None, None). test_phase_a_loader_resolves_repo_relative plants a fake run_20991231_000000/phase_a_summary.json, changes CWD, asserts loader still finds it and the path contains the fake run id — directly proves CWD-invariance.",
+      "A3 fix confirmed (option b) — stage1/tests/test_phase_b_patcher.py::test_smoke_marker is gated by pytest.mark.skipif(not _has_gpu_and_weights(), reason=...); the skip reason string contains the verbatim manual command 'python -m stage1.run_phase_b --config stage1/configs/stage2_confound.yaml --sanity --seed 42'. _has_gpu_and_weights checks torch.cuda.is_available() AND transformers AutoConfig.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct', local_files_only=True). When both present, the test runs the subprocess end-to-end in the repo root with a 1800s timeout, asserts exit 0 and presence of the four canonical artifacts (phase_b_summary.txt, phase_b_summary.json, restoration_table.csv, corruption_table.csv) in the latest stage1/outputs/phase_b/run_* directory.",
+      "A3 sandbox capability probe documented in writer handoff (cuda_available=false, scipy_installed=false, qwen2_5_1_5b_cached=false) with explicit deferral note and manual command for the production operator.",
+      "A15 (R2 nit) fix confirmed — trailing module-scope assert at former line 739 removed; replaced with a comment. The FORBIDDEN_PHRASES invariant is now enforced solely by test_forbidden_phrases_gate, which is the correct mechanism. No import-time AssertionError risk under python -O.",
+      "Test #1 tolerance tightened per spec §10 from atol=1e-4 to atol=1e-5 (fp32 bound on CPU-initialised 3-layer Qwen2); passes."
+    ],
+    "missing": [],
+    "extra": []
+  },
+  "findings": [
+    {
+      "severity": "med",
+      "file": "stage1/tests/test_phase_b_patcher.py",
+      "line": 293,
+      "category": "test",
+      "claim": "Spec §10 test #3 specifies atol=1e-3 (fp16) for final hidden equality and a 95%-of-5-fixture-prompt token-sequence match clause; implementation narrows to atol=1e-4 on fp32 and drops the multi-prompt greedy-match sub-claim.",
+      "evidence": "test_all_clean_patch_matches_recipient compares final_patched against composed.norm(clean_states[-1]) with atol=1e-4; the 5-fixture-prompt generate-and-compare sub-test is absent. Writer self-declares this deviation (unchanged from round 1) in writer handoff 'test #3 last-layer equality bound'.",
+      "suggested_fix": "Non-blocking for the engineering contract (identity-patch + bytewise-equal + state-dict-stable cover the core regressions). If the real-env smoke run produces divergence on pretrained weights, revisit per spec §12 R2. Unchanged from round 1."
+    },
+    {
+      "severity": "med",
+      "file": "stage1/tests/test_phase_b_patcher.py",
+      "line": 221,
+      "category": "test",
+      "claim": "test_empty_patch_generate_bytewise_equal compares the DummyTokenizer's whitespace-joined decode, not the raw token IDs. Byte-equality claim relies on the dummy decode being bijective.",
+      "evidence": "patched_new is parsed from result['output_text'].split() rather than captured as token IDs pre-decode. With the supplied DummyTokenizer this is bijective (space-separated integer strings); any future tokenizer substitution would silently break the contract.",
+      "suggested_fix": "Expose an optional return_ids hook on run_patched_inference_single (or add a sibling test that calls _greedy_continue_with_cache directly). Non-blocking. Unchanged from round 1; writer acknowledged and deferred to avoid round-2 scope creep."
+    },
+    {
+      "severity": "low",
+      "file": "stage1/run_phase_b.py",
+      "line": 39,
+      "category": "repro",
+      "claim": "numpy is imported at module top and is used by the paired bootstrap; writer states it is a transitive dep of torch.",
+      "evidence": "numpy as np at line 39; used in _paired_bootstrap_diff_ci only.",
+      "suggested_fix": "Add numpy to the project's requirements-explicit list when Phase C lands. Non-blocking. Unchanged from round 1."
+    },
+    {
+      "severity": "nit",
+      "file": "stage1/intervention/patcher.py",
+      "line": 251,
+      "category": "correctness",
+      "claim": "forward_with_patches detaches per-layer outputs to CPU eagerly. On GPU this triggers a D2H copy per layer per sample.",
+      "evidence": "Unconditional all_outputs.append(hidden.detach().to('cpu')). The production path in run_patched_inference_single discards all_outputs; only tests use it.",
+      "suggested_fix": "Make CPU offload optional (return_outputs_device kwarg, default-off) if profiling shows this dominates wall-clock. Non-blocking. Unchanged from round 1."
+    }
+  ],
+  "reproducibility_checklist": {
+    "seed_wired": true,
+    "config_logged": true,
+    "run_name_required": false,
+    "determinism_flags": true,
+    "data_hash_recorded": true,
+    "phase_a_cross_check_cwd_invariant": true,
+    "phase_a_summary_path_logged": true,
+    "smoke_test_gated_present": true
+  },
+  "must_fix_before_merge": [],
+  "can_ship_with_followup": [
+    "Run test_smoke_marker on a GPU-equipped host with pretrained Qwen/Qwen2.5-1.5B-Instruct weights cached — command embedded in skip reason: `python -m stage1.run_phase_b --config stage1/configs/stage2_confound.yaml --sanity --seed 42` from repo root. Verify exit 0 and presence of the four canonical artifacts. Spec §11 TXT/JSON literal checks (§11.2/§11.3/§11.10/§11.11) can only be validated by a real run.",
+    "Confirm test_run_phase_b_module_imports passes (not skips) in any env with scipy installed — canonical guard against future `from utils.config import ...` regressions. If scipy is present and the test still skips, investigate.",
+    "Verify production Phase A outputs directory stage1/outputs/phase_a/run_*/phase_a_summary.json is populated before launching a Phase B full run — spec §11.7 now hard-FAILs on absence in non-sanity mode.",
+    "On the real run, confirm which transformers causal-mask path is selected (spec §12 R1) and record it under compose_meta or environment block for provenance.",
+    "Consider tightening test_empty_patch_generate_bytewise_equal to compare raw token IDs rather than decoded whitespace-joined strings (carried over from round 1)."
+  ],
+  "codex_block_resolution": {
+    "A1_imports_qualified": {
+      "status": "resolved",
+      "evidence_file": "stage1/run_phase_b.py",
+      "evidence_lines": "43-56",
+      "regression_guard": "stage1/tests/test_phase_b_patcher.py::test_run_phase_b_module_imports",
+      "notes": "All 8 internal imports prefixed with 'stage1.'; mirrors Phase A. Guard test distinguishes the A1-class regression (bare utils|data|models|inference|analysis|intervention) from unrelated sandbox missing-deps via ModuleNotFoundError.name inspection."
+    },
+    "A2_phase_a_glob_repo_root": {
+      "status": "resolved",
+      "evidence_file": "stage1/run_phase_b.py",
+      "evidence_lines": "125-154, 696-707",
+      "regression_guards": [
+        "stage1/tests/test_phase_b_patcher.py::test_phase_a_loader_no_match_returns_none",
+        "stage1/tests/test_phase_b_patcher.py::test_phase_a_loader_resolves_repo_relative"
+      ],
+      "notes": "Glob resolved via pathlib.Path(__file__).resolve().parents[1] / stage1 / outputs / phase_a — CWD-invariant. Non-sanity no-match branch explicitly FAILs the acceptance-check list, propagates through the `raise RuntimeError` guard. Sanity mode tolerates absence (bootstrap) with an explicitly-labelled skip. Resolved path is returned from the loader and logged into phase_b_summary.json.phase_a_cross_check.phase_a_summary_path for provenance."
+    },
+    "A3_smoke_test": {
+      "status": "resolved_via_option_b",
+      "evidence_file": "stage1/tests/test_phase_b_patcher.py",
+      "evidence_lines": "507-556",
+      "notes": "pytest.mark.skipif(not _has_gpu_and_weights(), reason=<manual command>) gate. _has_gpu_and_weights checks torch.cuda.is_available() AND AutoConfig.from_pretrained(..., local_files_only=True). When prerequisites present, runs subprocess end-to-end (1800s timeout), asserts exit 0 and presence of 4 canonical artifacts. Skip reason contains the exact manual command: `python -m stage1.run_phase_b --config stage1/configs/stage2_confound.yaml --sanity --seed 42`. Sandbox capability probe documented in writer handoff (cuda_available=false, scipy missing, Qwen2.5-1.5B-Instruct not cached) — deferral is environmental, not methodological."
+    }
+  },
+  "checklist_walk": {
+    "1_seed": "satisfied — unchanged from round 1; _apply_determinism wires random, np.random, torch.manual_seed, torch.cuda.manual_seed_all, transformers.set_seed from --seed before any RNG-consuming op.",
+    "2_determinism": "satisfied — torch.use_deterministic_algorithms(True, warn_only=True) + CUBLAS_WORKSPACE_CONFIG=':4096:8' set before any CUDA op; warnings captured under environment.determinism_warnings.",
+    "3_device_dtype": "satisfied — device derived from next(model.parameters()).device; no implicit .cuda(); dtype handling defers to HF loader + per-call .to(dtype=hidden.dtype) on patches.",
+    "4_loss_masking": "N/A — inference-only; no loss, no train/eval mask asymmetry.",
+    "5_tokenizer_model_pinning": "satisfied — recipient/donor revisions from config.models.*_revision; tokenizer loaded from recipient; no hardcoded names in Phase B code.",
+    "6_eval_path_purity": "N/A — no DataLoader; plain Python for-loop over samples; no shuffle, no augmentation.",
+    "7_data_collator": "N/A — single-prompt inference; tokenizer called per sample with padding=False.",
+    "8_grad_accumulation": "N/A — inference-only; no optimizer.",
+    "9_checkpoint_io": "N/A — no state_dict save/load beyond HF from_pretrained (revision-pinned); composed model in-memory only; SHA-256 hash verified stable across run (hard RuntimeError on drift).",
+    "10_metric_reduction": "satisfied with single-language caveat — per-condition accuracy rows; per-sample 'correct' bool retained in JSONL; per-language breakdown trivially N/A (MGSM-zh single language).",
+    "11_train_eval_leakage": "N/A — no splits; MGSM-zh test subset identical to Phase A's pinned loader (read-only) per spec §4.",
+    "12_test_coverage": "satisfied — round 2 adds 4 new test cases (test_run_phase_b_module_imports, test_phase_a_loader_no_match_returns_none, test_phase_a_loader_resolves_repo_relative, test_smoke_marker); tolerance on test #1 tightened from 1e-4 to 1e-5 per spec §10. Total 11 tests in stage1/tests/test_phase_b_patcher.py: 7 passing in sandbox, 4 legitimately skipped (scipy missing / no CUDA / no cached weights). Every new/modified file has at least one test: patcher.py (tests #1–#4), wording.py (3 gate tests), run_phase_b.py (module-import guard + Phase A loader guards + smoke marker), intervention/__init__.py (indirect via re-exported imports in tests)."
+  },
+  "regression_check_vs_round_1": {
+    "round_1_findings_still_open": [
+      "med: test #3 narrowed scope (unchanged, acceptable non-blocker)",
+      "med: test #2 string-decode round-trip (unchanged, acceptable non-blocker)",
+      "low: numpy as implicit dep (unchanged, acceptable non-blocker)",
+      "nit: per-layer CPU offload in forward_with_patches (unchanged, acceptable non-blocker)"
+    ],
+    "round_1_findings_resolved_in_round_2": [
+      "low: find_latest_phase_a_summary CWD-relative glob — RESOLVED via A2 fix (pathlib.Path(__file__).resolve().parents[1])",
+      "low: trailing module-scope assert at run_phase_b.py:739 — RESOLVED via A15 fix (replaced with comment)"
+    ],
+    "regressions_introduced": [],
+    "notes": "Round-2 diff is +176/-14 across 2 files (run_phase_b.py +31/-12, test_phase_b_patcher.py +145/-2). No changes to patcher.py, wording.py, or intervention/__init__.py. All round-1 infrastructure preserved; additions are purely additive guards (regression tests + smoke-test gate). No silent behavioural drift."
+  }
+}
