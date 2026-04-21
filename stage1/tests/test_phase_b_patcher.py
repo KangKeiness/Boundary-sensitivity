@@ -26,30 +26,58 @@ if _REPO_ROOT not in sys.path:
 from stage1.utils.wording import FORBIDDEN_PHRASES, check_artifacts_for_forbidden
 
 # Try to import heavy deps; skip GPU/model tests cleanly if missing.
-# conftest.py injects a ``MagicMock`` stub for ``transformers`` at collection
-# time when the real package wasn't yet imported; detect that case and drop
-# the stub so the real package (if installed) can be resolved.
+#
+# v4 PRIORITY 4 — order-independence:
+#
+# conftest.py installs a deterministic transformers stub at session start.
+# To exercise the real GPU/model tests we must drop that stub and let Python
+# resolve the on-disk package. The dance below SNAPSHOTS the stub state
+# before mutation; if the real-import fails we restore the snapshot so
+# subsequent test modules (regardless of collection order) see the same
+# ``sys.modules`` state they would have seen if this module had not been
+# collected at all.
 _HAS_TORCH = True
+_RESTORED_AFTER_FAILURE = False
 try:
     import importlib
     import importlib.util
     import sys as _sys
-    import unittest.mock as _mock
 
-    _tf_mod = _sys.modules.get("transformers")
-    # conftest.py installs ``types.ModuleType("transformers")`` with MagicMock
-    # attributes but no ``__file__``; real transformers always has ``__file__``.
-    if _tf_mod is not None and not hasattr(_tf_mod, "__file__"):
-        for _k in list(_sys.modules):
-            if _k == "transformers" or _k.startswith("transformers."):
-                del _sys.modules[_k]
-    # Check on-disk installation (not sys.modules).
-    _spec = importlib.machinery.PathFinder.find_spec("transformers")
-    if _spec is None:
-        raise ImportError("transformers not installed on disk")
-    import torch  # noqa: F401
-    import transformers  # noqa: F401
-    from transformers.models.qwen2 import Qwen2Config as _Q  # noqa: F401
+    _stub_snapshot = {
+        _k: _v for _k, _v in list(_sys.modules.items())
+        if _k == "transformers" or _k.startswith("transformers.")
+    }
+    _is_stub = (
+        getattr(_sys.modules.get("transformers"), "__is_test_stub__", False)
+        # Backward compat: older stubs set no flag, only no __file__.
+        or (
+            "transformers" in _sys.modules
+            and not hasattr(_sys.modules["transformers"], "__file__")
+        )
+    )
+    if _is_stub:
+        for _k in list(_stub_snapshot):
+            del _sys.modules[_k]
+    try:
+        _spec = importlib.machinery.PathFinder.find_spec("transformers")
+        if _spec is None:
+            raise ImportError("transformers not installed on disk")
+        import torch  # noqa: F401
+        import transformers  # noqa: F401
+        from transformers.models.qwen2 import Qwen2Config as _Q  # noqa: F401
+    except Exception:
+        # Restore the conftest stub so subsequent test modules see the same
+        # sys.modules state regardless of collection order. Without this,
+        # earlier module-load behavior depended on whether
+        # test_phase_b_patcher was collected before or after the dependent
+        # tests, which made subset/full pytest runs disagree (v4 P4).
+        if _is_stub:
+            for _k in list(_sys.modules):
+                if _k == "transformers" or _k.startswith("transformers."):
+                    del _sys.modules[_k]
+            _sys.modules.update(_stub_snapshot)
+        _RESTORED_AFTER_FAILURE = True
+        raise
 except Exception:
     _HAS_TORCH = False
 
@@ -299,6 +327,194 @@ def test_all_clean_patch_matches_recipient():
     assert max_diff_last < 1e-5, (
         f"last layer output not overwritten by patch: max_diff_last={max_diff_last}"
     )
+
+
+@requires_torch
+def test_input_side_patch_cache_consistency_identity():
+    """Input+output patching with the model's OWN clean states must be a no-op
+    on cache state.
+
+    Priority 1 repair (post-RED-LIGHT): the new ``forward_with_patches``
+    applies an INPUT-side patch BEFORE each patched layer's forward call so
+    the prompt-KV cache slot at that layer reflects the clean input. When the
+    composed model equals the source model (so ``clean_layer_states`` came
+    from the same model we are patching), the input + output patches are
+    semantically no-ops and the resulting DynamicCache must equal the
+    unpatched run's cache exactly.
+
+    This is the strongest invariant that does not require comparing across
+    models with different weights; combined with
+    ``test_all_clean_patch_matches_recipient`` (residual-equivalence under
+    cross-model patching) it covers the new patch semantics.
+    """
+    import torch
+    from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+    from stage1.intervention.patcher import (
+        extract_all_layer_hidden_states,
+        forward_with_patches,
+    )
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(
+        vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=64, rope_theta=10000.0,
+    )
+    model = Qwen2ForCausalLM(cfg).eval()
+
+    class DummyTokenizer:
+        eos_token_id = None
+
+        def __call__(self, text, return_tensors=None, padding=False):
+            ids = [b % cfg.vocab_size for b in text.encode("utf-8")[:6]]
+
+            class _O:
+                pass
+
+            o = _O()
+            o.input_ids = torch.tensor([ids], dtype=torch.long)
+            return o
+
+    tok = DummyTokenizer()
+    prompt = "abcdef"
+
+    own_states = extract_all_layer_hidden_states(model, tok, prompt)
+    input_ids = tok(prompt).input_ids
+
+    # Patch layers 1, 2 (skip layer 0 — its input is the embedding which is
+    # never patched in production patch sets, and forward_with_patches rejects
+    # input-side patch at layer 0).
+    patched_layers = [1, 2]
+    patch_states = {n: own_states[n] for n in patched_layers}
+    patch_input_states = {n: own_states[n - 1] for n in patched_layers}
+
+    with torch.no_grad():
+        unpatched_hidden, _, unpatched_cache = forward_with_patches(
+            model, input_ids, patch_states={},
+        )
+        patched_hidden, _, patched_cache = forward_with_patches(
+            model, input_ids,
+            patch_states=patch_states,
+            patch_input_states=patch_input_states,
+        )
+
+    # Final hidden must match (no-op patches).
+    final_diff = (patched_hidden - unpatched_hidden).abs().max().item()
+    assert final_diff < 1e-5, f"final hidden diverged under no-op patches: {final_diff}"
+
+    # Cache slot for each patched layer must match the unpatched cache exactly.
+    for n in patched_layers:
+        k_diff = (patched_cache.key_cache[n] - unpatched_cache.key_cache[n]).abs().max().item()
+        v_diff = (patched_cache.value_cache[n] - unpatched_cache.value_cache[n]).abs().max().item()
+        assert k_diff < 1e-5, f"K cache at layer {n} diverged: {k_diff}"
+        assert v_diff < 1e-5, f"V cache at layer {n} diverged: {v_diff}"
+
+
+@requires_torch
+def test_input_side_patch_changes_cache_when_input_differs():
+    """Input-side patch must materially change the prompt-KV cache when the
+    patched input differs from what the model would have computed.
+
+    Priority 1 repair: this test catches the regression in which input-side
+    patching is silently dropped (e.g., a refactor that forgets to thread
+    ``patch_input_states`` through). We construct a synthetic "clean" tensor
+    that visibly differs from the model's natural layer-(N-1) output, patch it
+    in as the input to layer N, and assert that cache[N] now differs from the
+    unpatched cache. Also asserts that without the input patch, cache[N] is
+    UNCHANGED — which is the failure mode of the old code.
+    """
+    import torch
+    from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+    from stage1.intervention.patcher import forward_with_patches
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(
+        vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=64, rope_theta=10000.0,
+    )
+    model = Qwen2ForCausalLM(cfg).eval()
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 6), dtype=torch.long)
+
+    # Patch input to layer 2 with a fixed pattern that is highly unlikely to
+    # equal the natural h_1 output.
+    fake_clean_input = torch.full((1, 6, cfg.hidden_size), 0.5)
+    fake_clean_output = torch.full((1, 6, cfg.hidden_size), 0.7)
+
+    with torch.no_grad():
+        # Baseline: unpatched.
+        _, _, base_cache = forward_with_patches(model, input_ids, patch_states={})
+
+        # Old-behavior reproduction: output-only patch at layer 2.
+        # cache[2] should be IDENTICAL to baseline (because layer 2's input
+        # was unpatched in this run).
+        _, _, output_only_cache = forward_with_patches(
+            model, input_ids,
+            patch_states={2: fake_clean_output},
+        )
+
+        # New behavior: input + output patch at layer 2.
+        # cache[2] MUST differ from baseline because layer 2 now sees the
+        # fake_clean_input.
+        _, _, both_cache = forward_with_patches(
+            model, input_ids,
+            patch_states={2: fake_clean_output},
+            patch_input_states={2: fake_clean_input},
+        )
+
+    # Old failure mode: output-only patch leaves cache[2] unchanged.
+    k_diff_old = (output_only_cache.key_cache[2] - base_cache.key_cache[2]).abs().max().item()
+    assert k_diff_old < 1e-6, (
+        f"output-only patch unexpectedly altered cache[2] (diff={k_diff_old}); "
+        f"the test premise is wrong"
+    )
+
+    # Priority 1 fix: input-side patch MUST move cache[2] away from baseline.
+    k_diff_new = (both_cache.key_cache[2] - base_cache.key_cache[2]).abs().max().item()
+    v_diff_new = (both_cache.value_cache[2] - base_cache.value_cache[2]).abs().max().item()
+    assert k_diff_new > 1e-3, (
+        f"input-side patch failed to update cache[2] keys (diff={k_diff_new}); "
+        f"this is the Priority 1 cache-consistency bug"
+    )
+    assert v_diff_new > 1e-3, (
+        f"input-side patch failed to update cache[2] values (diff={v_diff_new})"
+    )
+
+
+@requires_torch
+def test_layer_zero_input_patch_rejected():
+    """Input-side patch at layer 0 must raise ValueError.
+
+    Priority 1 repair: layer 0's input is the embedding output, which is
+    intentionally never patched (and would require extracting the embedding
+    output separately). Production patch sets all start at layer ≥ 1; the
+    code enforces this.
+    """
+    import pytest
+    import torch
+    from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+    from stage1.intervention.patcher import forward_with_patches
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(
+        vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=64, rope_theta=10000.0,
+    )
+    model = Qwen2ForCausalLM(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4), dtype=torch.long)
+    fake = torch.zeros((1, 4, cfg.hidden_size))
+
+    with pytest.raises(ValueError, match="Input-side patch at layer 0"):
+        forward_with_patches(
+            model, input_ids,
+            patch_states={},
+            patch_input_states={0: fake},
+        )
 
 
 @requires_torch

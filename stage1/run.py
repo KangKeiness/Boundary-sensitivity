@@ -1,4 +1,16 @@
-"""Stage 1 pipeline: MGSM multilingual evaluation with Qwen2.5-1.5B boundary sweep."""
+"""Stage 1 main runner entrypoint.
+
+Runtime contract:
+    This module imports the full model stack (``torch``, ``transformers``) at
+    import time. ``python -m stage1.run --help`` and ``import stage1.run``
+    therefore require the ML runtime to be installed, not just the
+    configuration layer. Lightweight environments (e.g. CI lanes that only
+    validate config-loading) should import ``stage1.utils.config`` directly
+    instead.
+
+    See ``stage1/tests/test_runtime_smoke.py`` for dependency-gated smoke
+    coverage of the import / ``-m --help`` paths.
+"""
 
 import argparse
 import gc
@@ -8,14 +20,14 @@ import os
 
 import torch
 
-from utils.config import load_config, setup_logging
-from data.loader import load_mgsm
-from models.composer import load_models, get_condition_model
-from inference.runner import run_inference
-from inference.parser import parse_answer
-from analysis.bds import compute_bds
-from analysis.evaluator import evaluate_experiment
-from utils.logger import (
+from stage1.utils.config import load_config, setup_logging
+from stage1.data.loader import load_mgsm
+from stage1.models.composer import load_models, get_condition_model
+from stage1.inference.runner import run_inference
+from stage1.inference.parser import parse_answer
+from stage1.analysis.bds import compute_bds
+from stage1.analysis.evaluator import evaluate_experiment
+from stage1.utils.logger import (
     create_run_dir,
     save_results,
     save_hidden_states,
@@ -238,8 +250,17 @@ def main():
     recipient, donor, tokenizer = load_models(
         recipient_name=config.models.recipient,
         donor_name=config.models.donor,
+        # RED LIGHT final fix: forward revision args so actual loaded weights
+        # match the manifest-declared revisions. Without this, manifest parity
+        # reports pinned revision matching but the model may use HEAD/main.
+        recipient_revision=getattr(config.models, "recipient_revision", None),
+        donor_revision=getattr(config.models, "donor_revision", None),
     )
     print("  Models loaded successfully")
+    if getattr(config.models, "recipient_revision", None):
+        print(f"  Recipient revision: {config.models.recipient_revision}")
+    if getattr(config.models, "donor_revision", None):
+        print(f"  Donor revision: {config.models.donor_revision}")
 
     conditions = build_conditions(config)
     print(f"\nConditions to run: {[c[0] for c in conditions]}")

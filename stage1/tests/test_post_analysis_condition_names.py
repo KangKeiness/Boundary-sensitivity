@@ -116,6 +116,58 @@ def test_infer_b_for_condition_fixed_b_family():
     assert _infer_b_for_condition("fixed_b12_w2", {}) == 12
 
 
+# ── RED LIGHT P3: regression tests for fixed_w4_* boundary inference ─────────
+
+def test_infer_b_for_fixed_w4_pos1():
+    """fixed_w4_pos1 → b=4 (from PHASE_A_GRID: (4, 8))."""
+    assert _infer_b_for_condition("fixed_w4_pos1", {}) == 4
+
+
+def test_infer_b_for_fixed_w4_pos2():
+    """fixed_w4_pos2 → b=8 (from PHASE_A_GRID: (8, 12))."""
+    assert _infer_b_for_condition("fixed_w4_pos2", {}) == 8
+
+
+def test_infer_b_for_fixed_w4_pos3():
+    """fixed_w4_pos3 → b=12 (from PHASE_A_GRID: (12, 16))."""
+    assert _infer_b_for_condition("fixed_w4_pos3", {}) == 12
+
+
+def test_infer_b_for_fixed_w4_pos4():
+    """fixed_w4_pos4 → b=16 (from PHASE_A_GRID: (16, 20))."""
+    assert _infer_b_for_condition("fixed_w4_pos4", {}) == 16
+
+
+def test_infer_b_for_fixed_b8_w2():
+    """fixed_b8_w2 → b=8 (from PHASE_A_GRID: (8, 10))."""
+    assert _infer_b_for_condition("fixed_b8_w2", {}) == 8
+
+
+def test_infer_b_for_fixed_b8_w4():
+    """fixed_b8_w4 → b=8 (from PHASE_A_GRID: (8, 12))."""
+    assert _infer_b_for_condition("fixed_b8_w4", {}) == 8
+
+
+def test_infer_b_for_fixed_b8_w6():
+    """fixed_b8_w6 → b=8 (from PHASE_A_GRID: (8, 14))."""
+    assert _infer_b_for_condition("fixed_b8_w6", {}) == 8
+
+
+def test_infer_b_for_fixed_b8_w8():
+    """fixed_b8_w8 → b=8 (from PHASE_A_GRID: (8, 16))."""
+    assert _infer_b_for_condition("fixed_b8_w8", {}) == 8
+
+
+def test_infer_b_for_random_fixed_w4():
+    """random_fixed_w4_pos1 → b=4 (from PHASE_A_GRID: random_ prefix maps to (4, 8))."""
+    assert _infer_b_for_condition("random_fixed_w4_pos1", {}) == 4
+
+
+def test_infer_b_for_random_fixed_b8():
+    """random_fixed_b8_w4 → b=8 (from PHASE_A_GRID: random_ prefix maps to (8, 12))."""
+    assert _infer_b_for_condition("random_fixed_b8_w4", {}) == 8
+
+
 def test_condition_name_prefixes_constant_contains_all_families():
     for p in (
         "hard_swap_b", "random_donor_b", "fixed_w4_",

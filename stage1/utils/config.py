@@ -98,7 +98,8 @@ def load_config(config_path: str) -> Stage1Config:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with open(path) as f:
+    # UTF-8 enforced: config loading must not depend on OS locale (Windows cp949).
+    with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     config = Stage1Config(

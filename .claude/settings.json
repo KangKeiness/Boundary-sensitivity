@@ -1,0 +1,87 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Edit(stage1/**)",
+      "Write(stage1/**)",
+      "Edit(notes/**)",
+      "Write(notes/**)",
+      "Edit(eval/**)",
+      "Write(eval/**)",
+      "Edit(tests/**)",
+      "Write(tests/**)",
+      "Grep(**)",
+      "Glob(**)",
+      "Bash(python *)",
+      "Bash(pytest *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(wc *)",
+      "Bash(find *)",
+      "Bash(ruff *)",
+      "Bash(mypy *)"
+    ],
+    "deny": [
+      "Write(paper/**)",
+      "Edit(paper/**)",
+      "Write(data/raw/**)",
+      "Edit(data/raw/**)",
+      "Write(runs/**)",
+      "Edit(runs/**)",
+      "Write(outputs/**)",
+      "Edit(outputs/**)",
+      "Write(.env)",
+      "Write(.env.*)",
+      "Edit(.env)",
+      "Edit(.env.*)",
+      "Write(configs/secrets/**)",
+      "Edit(configs/secrets/**)",
+      "Bash(rm -rf*)",
+      "Bash(rm -fr*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean -f*)",
+      "Bash(git clean -fd*)",
+      "Bash(pip install*)",
+      "Bash(pip uninstall*)",
+      "Bash(curl*)",
+      "Bash(wget*)",
+      "Bash(huggingface-cli upload*)",
+      "Bash(wandb login*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/block_sensitive_paths.sh" },
+          { "type": "command", "command": ".claude/hooks/secret_scan.sh" },
+          { "type": "command", "command": ".claude/hooks/paper_claim_lock.sh" }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/bash_allowlist.sh" },
+          { "type": "command", "command": ".claude/hooks/training_guard.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/format_and_lint.sh" }
+        ]
+      }
+    ]
+  }
+}

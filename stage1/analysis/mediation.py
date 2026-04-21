@@ -121,8 +121,15 @@ def load_condition_correctness(jsonl_path: str) -> ConditionCorrectness:
 
 def align_by_sample_id(
     *conditions: ConditionCorrectness,
+    strict: bool = False,
 ) -> Tuple[List[str], List[np.ndarray]]:
     """Intersect sample_ids across all inputs, returning aligned arrays.
+
+    Args:
+        conditions: One or more ConditionCorrectness objects.
+        strict: When True (RED LIGHT Fix C), any sample-ID mismatch is a hard
+            error. Exact equality of sample-ID sets across all conditions is
+            required. This is the mandatory mode for non-sanity Phase C runs.
 
     Returns:
         ``(aligned_ids, arrays)`` where ``aligned_ids`` is the sorted
@@ -130,10 +137,9 @@ def align_by_sample_id(
         of ``np.ndarray`` (dtype=int8, 0/1) in the same order as the inputs,
         each of length ``len(aligned_ids)``.
 
-    Side effect:
-        For every input whose ``sample_ids`` is a strict superset of the
-        aligned set, a WARNING is logged naming the condition and the dropped
-        count (substring ``"dropped"``).
+    Raises:
+        ValueError: When ``strict=True`` and sample-ID sets are not identical
+            across all conditions.
     """
     if not conditions:
         raise ValueError("align_by_sample_id requires at least one ConditionCorrectness")
@@ -142,10 +148,43 @@ def align_by_sample_id(
     common = set.intersection(*id_sets)
     aligned_ids: List[str] = sorted(common)
 
+    # RED LIGHT Fix C: strict mode — no silent intersection behavior.
+    if strict:
+        for c in conditions:
+            cond_set = set(c.sample_ids)
+            if cond_set != common:
+                missing = common - cond_set
+                extra = cond_set - common
+                diag_parts = [
+                    f"Condition {c.condition!r}: sample-ID mismatch vs aligned set."
+                ]
+                if missing:
+                    examples = sorted(missing)[:5]
+                    diag_parts.append(
+                        f"  Missing from this condition ({len(missing)} IDs): "
+                        f"{examples}{'...' if len(missing) > 5 else ''}"
+                    )
+                if extra:
+                    examples = sorted(extra)[:5]
+                    diag_parts.append(
+                        f"  Extra in this condition ({len(extra)} IDs): "
+                        f"{examples}{'...' if len(extra) > 5 else ''}"
+                    )
+                diag_parts.append(
+                    f"  |aligned|={len(common)}, |condition|={len(cond_set)}"
+                )
+                raise ValueError("\n".join(diag_parts))
+
     arrays: List[np.ndarray] = []
     for c in conditions:
         dropped = len(c.sample_ids) - len(aligned_ids)
         if dropped > 0:
+            if strict:
+                # Should not reach here (caught above), but guard anyway.
+                raise ValueError(
+                    f"Condition {c.condition!r}: {dropped} sample_id(s) dropped "
+                    f"in strict mode — this is a bug."
+                )
             logger.warning(
                 "Condition %s: dropped %d sample_id(s) not in the aligned "
                 "intersection (|aligned|=%d, |condition|=%d).",
@@ -416,6 +455,7 @@ def compute_decomposition_table(
     seed: int = _DEFAULT_SEED,
     ci: float = _DEFAULT_CI,
     epsilon_denom: float = EPSILON_DENOM,
+    strict_sample_ids: bool = False,
 ) -> Dict[str, Any]:
     """Orchestrate Phase C decomposition from a Phase B run directory.
 
@@ -458,15 +498,21 @@ def compute_decomposition_table(
             correct=raw.correct,
         )
 
+    # RED LIGHT Fix C: strict sample-ID alignment check.
+    # In non-sanity mode, ALL conditions must share the exact same sample-ID set.
+    # Any mismatch is a hard fail — no silent intersection behavior.
+    if strict_sample_ids:
+        all_conditions_for_check = [clean, no_patch] + list(patched_by_name.values())
+        # This will raise ValueError with detailed diagnostics on any mismatch.
+        align_by_sample_id(*all_conditions_for_check, strict=True)
+        logger.info(
+            "Strict sample-ID check PASSED: %d conditions, %d shared IDs.",
+            len(all_conditions_for_check), len(set(clean.sample_ids)),
+        )
+
     # Per-condition restoration_effect (+ per-condition residual_effect and
-    # restoration_proportion — the reviewer requested NIE/NDE/MP columns per
-    # patch condition, not only for the best pick). Alias columns map:
-    #   restoration_effect       ≡ NIE   (acc(patched)  - acc(no_patch))
-    #   residual_effect          ≡ NDE   (acc(clean)    - acc(patched))
-    #   total_effect             ≡ TE    (acc(clean)    - acc(no_patch))
-    #   restoration_proportion   ≡ MP    (NIE / TE; null when |TE| < EPSILON_DENOM)
-    # Phase C wording MUST avoid formal NIE/NDE/MP/causal-mediation terminology
-    # in prose; the aliases exist only in machine-readable columns for audit.
+    # restoration_proportion). Phase C wording MUST avoid formal NIE/NDE/MP/
+    # causal-mediation terminology in ALL artifacts (RED LIGHT P5).
     rows: List[Dict[str, Any]] = []
     # no_patch is included for audit (trivially 0, 0, 0, n, 0).
     ids_all, (np_vec,) = align_by_sample_id(no_patch)
@@ -489,11 +535,6 @@ def compute_decomposition_table(
         "restoration_proportion_ci_lo": None,
         "restoration_proportion_ci_hi": None,
         "total_effect": total_effect_aligned,
-        # NIE/NDE/MP aliases for downstream cross-audience tools.
-        "alias_NIE": 0.0,
-        "alias_NDE": total_effect_aligned,
-        "alias_TE": total_effect_aligned,
-        "alias_MP": 0.0,
         "n_aligned": len(ids_all),
     })
 
@@ -533,11 +574,6 @@ def compute_decomposition_table(
             "restoration_proportion_ci_hi": mp_res["ci_hi"],
             "restoration_proportion_ci_reason": mp_res["ci_reason"],
             "total_effect": total_effect_aligned,
-            # NIE/NDE/MP aliases — audit-only; prose uses mapped terminology.
-            "alias_NIE": re_res["point"],
-            "alias_NDE": nde_res["point"],
-            "alias_TE": total_effect_aligned,
-            "alias_MP": mp_res["point"],
             "n_aligned": re_res["n_aligned"],
         })
 

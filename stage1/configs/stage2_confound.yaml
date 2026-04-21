@@ -1,5 +1,18 @@
-# Phase A - Width Confound Separation Grid
-# Separates boundary-position effects from swap-width effects.
+# Phase A / Phase B config — Width Confound Separation Grid.
+# Also drives the Stage 1 sweep run that supplies the hard_swap_b8 anchor for
+# Phase B's cross-check. To produce a Phase-B-compatible Stage 1 anchor:
+#     python -m stage1.run --config stage1/configs/stage2_confound.yaml
+# (stage1_main.yaml has max_new_tokens=256 and will be rejected by the
+# manifest-parity filter — see notes/anchors_workflow.md.)
+#
+# PARITY CONTRACT (do not diverge between this YAML and any anchor's YAML):
+#   - models.recipient / models.donor / *_revision (pinned SHAs below)
+#   - dataset.{name,lang,split}
+#   - generation.{do_sample,temperature,max_new_tokens}
+#   - hidden_state.pooling
+# Any field above mismatched against a candidate anchor's manifest.json causes
+# that anchor to be rejected by stage1.utils.manifest_parity, and Phase B will
+# hard-fail with a "missing anchor(s)" error.
 
 models:
   recipient: "Qwen/Qwen2.5-1.5B-Instruct"
@@ -49,7 +62,9 @@ dataset:
 generation:
   do_sample: false
   temperature: 0.0
-  max_new_tokens: 512   # spec says 512
+  max_new_tokens: 512   # spec says 512 — MUST match the anchor Stage 1 run's max_new_tokens
+                        # (otherwise the parity filter rejects the anchor; see
+                        # notes/anchors_workflow.md §2 "max_new_tokens footgun").
 
 evaluation:
   bootstrap_n: 1000

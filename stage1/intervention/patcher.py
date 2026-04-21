@@ -183,20 +183,80 @@ def forward_with_patches(
     input_ids: torch.Tensor,
     patch_states: Dict[int, torch.Tensor],
     *,
+    patch_input_states: Optional[Dict[int, torch.Tensor]] = None,
     return_cache: bool = True,
 ):
     """Manual per-layer Qwen2 prompt forward with hidden-state patching.
 
-    Patches hidden states AFTER each specified layer; the patched hidden is
-    passed to the next layer, so downstream KV cache entries are computed from
-    the patched residual stream. The ``DynamicCache`` returned is populated by
-    passing ``past_key_values=cache`` and ``use_cache=True`` to each layer call
-    and is suitable for seeding a greedy continuation.
+    PATCH SEMANTICS (post-RED-LIGHT repair, Priority 1):
+        For each patched layer N we apply BOTH an INPUT-side and an OUTPUT-side
+        patch. The input-side patch is what fixes the prompt-KV-cache
+        inconsistency that the previous "output-only" implementation had. The
+        output-side patch makes the residual flowing into layer N+1 explicitly
+        equal to the clean residual at that boundary.
+
+        Concretely, with ``hidden`` denoting the residual at the layer-N input:
+            1. If ``layer_idx in patch_input_states``: replace ``hidden`` with
+               ``patch_input_states[layer_idx]`` BEFORE calling layer N. This
+               causes layer N to project K and V from clean input, so the
+               ``DynamicCache`` slot for layer N stores keys/values that match
+               what the clean model would have written. This is the fix for
+               continuation-time attention (autoregressive tokens read prompt
+               KVs, so cache consistency is required for the patch to persist
+               beyond the first generated token).
+            2. After layer N's forward, if ``layer_idx in patch_states``,
+               replace the residual with ``patch_states[layer_idx]`` so the
+               input to layer N+1 is exactly the clean residual at boundary N.
+
+        For a patched layer set {N0, N1, ...} with N0 the smallest, only the
+        input patch at N0 is strictly necessary for cache consistency (because
+        the output patch at Nk-1 already provides the clean input to Nk for
+        k≥1). We apply input patches at every patched layer for symmetry and
+        to keep the implementation order-independent.
+
+    OLD BUG (for the record):
+        The previous implementation called layer N first, then overrode the
+        hidden state. Cache[N] therefore stored K/V projected from the *input
+        to* layer N, which was the unpatched residual. For ``patch_final_only
+        [27]`` this meant the patch only altered the first-token logit (via
+        lm_head on the patched final hidden); every subsequent autoregressive
+        token attended to unpatched K_27 in the prompt cache, effectively
+        nullifying the intervention beyond token 0. For multi-layer patches
+        such as ``patch_recovery_full [20..27]`` the inconsistency was bounded
+        to cache[20] (downstream cache entries became consistent because their
+        layer inputs came from the patched residual chain).
+
+    WHAT IS AND IS NOT PATCHED (under the new semantics):
+        Patched per layer N in patch_states:
+            - cache slot N (K/V projected from clean h_{N-1})
+            - residual carried into layer N+1 (= clean h_N)
+        NOT patched:
+            - layer N's own weights (this is an activation patch, not a
+              weight transplant)
+            - autoregressive continuation tokens' own forward (the composed
+              model's weights still process them; the patch propagates only
+              through the prompt-KV cache they attend to)
+            - the embedding lookup (patches starting at layer 0 are rejected
+              upstream by ``run_patched_inference_single``)
+        Limitations:
+            - This remains a prompt-side intervention. Generation tokens are
+              affected only via the patched prompt KVs they attend to.
+            - Restoration interpretation is "patch the residual stream from
+              boundary N onward to be clean, with cache state consistent with
+              that residual". It is NOT "transplant clean weights into layer
+              N" and is NOT a formal causal-mediation identification.
 
     Args:
         model: The model to run forward through (composed or recipient).
         input_ids: [1, S] input token IDs on the model's device.
-        patch_states: {layer_index: tensor [1, S, H]} injected after that layer.
+        patch_states: {layer_index: tensor [1, S, H]} OUTPUT-side patch —
+            replaces the residual AFTER layer N's forward.
+        patch_input_states: {layer_index: tensor [1, S, H]} INPUT-side patch —
+            replaces the residual BEFORE layer N's forward, so layer N writes
+            consistent K/V to the cache. Must satisfy ``layer_index >= 1``
+            (layer 0's input is the embedding output, which is never patched
+            in any production patch set; ``run_patched_inference_single``
+            rejects layer-0 patches upstream).
         return_cache: When False, returns a ``None`` in place of the cache tuple
             element (used by equivalence tests that only care about final hidden).
 
@@ -221,8 +281,27 @@ def forward_with_patches(
     cache_position = inputs["cache_position"]
 
     all_outputs: List[torch.Tensor] = []
+    if patch_input_states is None:
+        patch_input_states = {}
 
     for layer_idx, layer in enumerate(layers):
+        # INPUT-side patch (Priority 1 repair): replace residual BEFORE the
+        # layer's forward so K/V written to cache reflect the clean input.
+        if layer_idx in patch_input_states:
+            if layer_idx == 0:
+                raise ValueError(
+                    "Input-side patch at layer 0 is not supported (the input "
+                    "would be the embedding output, which is intentionally "
+                    "never patched). All production patch sets exclude layer 0."
+                )
+            patch_in = patch_input_states[layer_idx]
+            if patch_in.shape != hidden.shape:
+                raise ValueError(
+                    f"Input-side patch shape mismatch at layer {layer_idx}: "
+                    f"expected {hidden.shape}, got {patch_in.shape}"
+                )
+            hidden = patch_in.to(device=hidden.device, dtype=hidden.dtype)
+
         layer_output = layer(
             hidden,
             attention_mask=attention_mask_4d,
@@ -239,11 +318,13 @@ def forward_with_patches(
         else:
             hidden = layer_output
 
+        # OUTPUT-side patch: replace residual AFTER the layer's forward so the
+        # input to layer N+1 is exactly the clean residual at boundary N.
         if layer_idx in patch_states:
             patch = patch_states[layer_idx]
             if patch.shape != hidden.shape:
                 raise ValueError(
-                    f"Patch shape mismatch at layer {layer_idx}: "
+                    f"Output-side patch shape mismatch at layer {layer_idx}: "
                     f"expected {hidden.shape}, got {patch.shape}"
                 )
             hidden = patch.to(device=hidden.device, dtype=hidden.dtype)
@@ -399,22 +480,41 @@ def run_patched_inference_single(
     input_ids = tokenizer(prompt, return_tensors="pt", padding=False).input_ids.to(device)
     prompt_len = input_ids.shape[1]
 
-    # Build patch_states dict
+    # Build patch_states (output-side) AND patch_input_states (input-side) so
+    # that for each patched layer N the prompt-KV cache slot is populated from
+    # the clean (or corrupt) input — i.e., the residual that layer N would have
+    # seen in the recipient (or composed) model. This is the Priority 1 fix
+    # for the cache-consistency bug.
     patch_states: Dict[int, torch.Tensor] = {}
+    patch_input_states: Dict[int, torch.Tensor] = {}
     for layer_idx in patch_config.patch_layers:
+        if layer_idx == 0:
+            raise ValueError(
+                "Patch at layer 0 is not supported (input-side patch would be "
+                "the embedding output, which is intentionally never patched). "
+                "All production patch sets exclude layer 0."
+            )
         if patch_config.direction == "restoration":
             if clean_layer_states is None:
                 raise ValueError("clean_layer_states required for restoration patches")
-            patch_states[layer_idx] = clean_layer_states[layer_idx].to(device)
+            src = clean_layer_states
         else:  # corruption
             if corrupt_layer_states is None:
                 raise ValueError("corrupt_layer_states required for corruption patches")
-            patch_states[layer_idx] = corrupt_layer_states[layer_idx].to(device)
+            src = corrupt_layer_states
+        # Output-side: replace residual after layer N → clean h_N.
+        patch_states[layer_idx] = src[layer_idx].to(device)
+        # Input-side: replace residual before layer N → clean h_{N-1}, the
+        # input layer N would have seen in the source model. This makes
+        # cache[layer_idx] consistent with the patched residual.
+        patch_input_states[layer_idx] = src[layer_idx - 1].to(device)
 
     model.eval()
     with torch.no_grad():
         final_hidden, _, cache = forward_with_patches(
-            model, input_ids, patch_states, return_cache=True
+            model, input_ids, patch_states,
+            patch_input_states=patch_input_states,
+            return_cache=True,
         )
         # First token comes from lm_head applied to the patched final hidden.
         first_token_logits = model.lm_head(final_hidden[:, -1, :])

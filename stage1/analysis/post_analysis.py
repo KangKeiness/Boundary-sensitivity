@@ -98,15 +98,66 @@ def _enumerate_conditions(hs: Dict, boundary_grid: List[int]) -> List[str]:
     return out
 
 
+# v4 P3 — static Phase A grid mirror.
+# Mirrors ``stage1.models.composer.PHASE_A_GRID`` byte-for-byte. The two tables
+# MUST stay in sync; ``test_post_analysis_static_grid_matches_composer``
+# imports composer (when torch is available) and asserts equality. The static
+# copy here lets analysis run in environments without torch / transformers.
+_STATIC_FIXED_W4_GRID: Dict[str, Tuple[int, int]] = {
+    "fixed_w4_pos1": (4, 8),
+    "fixed_w4_pos2": (8, 12),
+    "fixed_w4_pos3": (12, 16),
+    "fixed_w4_pos4": (16, 20),
+}
+_STATIC_FIXED_B8_GRID: Dict[str, Tuple[int, int]] = {
+    "fixed_b8_w2": (8, 10),
+    "fixed_b8_w4": (8, 12),
+    "fixed_b8_w6": (8, 14),
+    "fixed_b8_w8": (8, 16),
+}
+_STATIC_PHASE_A_GRID: Dict[str, Tuple[int, int]] = {
+    **_STATIC_FIXED_W4_GRID,
+    **_STATIC_FIXED_B8_GRID,
+    **{f"random_{k}": v for k, v in _STATIC_FIXED_W4_GRID.items()},
+    **{f"random_{k}": v for k, v in _STATIC_FIXED_B8_GRID.items()},
+}
+
+
 def _infer_b_for_condition(cond: str, run_data: Dict) -> int:
     """Infer the boundary value ``b`` for a non-legacy condition name.
 
     For legacy ``hard_swap_b{b}`` / ``random_donor_b{b}`` names this helper
     is not used (the caller iterates ``boundary_grid`` directly). For new
-    families, ``b`` is resolved from the condition suffix where possible
-    (``fixed_b8_*`` → 8) or from ``run_data['t_fixed']`` as a Phase B
-    compose-meta fallback (``patch_*``, ``corrupt_*`` — b=8 per spec).
+    families, ``b`` is resolved from a static grid that mirrors
+    ``composer.PHASE_A_GRID``.
+
+    v4 P3: the static grid below is the *primary* source — analysis must not
+    depend on whether ``composer`` (which transitively requires torch /
+    transformers) is importable. The canonical ``composer.PHASE_A_GRID`` is
+    consulted only as an upgrade path *if* it imports successfully, to catch
+    drift between the two grids in environments that have both. A drift would
+    hard-fail with a ``ValueError`` at first use, not silently disagree.
+
+    Cross-checked at test time by
+    ``test_post_analysis_static_grid_matches_composer``.
     """
+    if cond in _STATIC_PHASE_A_GRID:
+        b_val, _t_val = _STATIC_PHASE_A_GRID[cond]
+        # Drift-detection upgrade path — only when composer is importable.
+        try:
+            from stage1.models.composer import PHASE_A_GRID
+        except Exception:
+            PHASE_A_GRID = None  # noqa: N806 — torch/transformers absent
+        if PHASE_A_GRID is not None and cond in PHASE_A_GRID:
+            heavy_b, heavy_t = PHASE_A_GRID[cond]
+            if (heavy_b, heavy_t) != (b_val, _t_val):
+                raise ValueError(
+                    f"Phase A grid drift: composer.PHASE_A_GRID[{cond!r}]="
+                    f"{(heavy_b, heavy_t)} but post_analysis._STATIC_PHASE_A_GRID"
+                    f"[{cond!r}]={(b_val, _t_val)}. Re-sync the two tables."
+                )
+        return b_val
+
     if cond.startswith("fixed_b"):
         # fixed_b8_xxx → 8
         suffix = cond[len("fixed_b"):]
@@ -119,9 +170,14 @@ def _infer_b_for_condition(cond: str, run_data: Dict) -> int:
         if num:
             return int("".join(num))
     if cond.startswith("fixed_w"):
-        # fixed_w4_pos1 → the grid is width-confound; b is not meaningful.
-        # Fall through to boundary_grid[-1] as a conservative default.
-        pass
+        # If we reached here the static grid did not contain ``cond`` — that
+        # means an unknown fixed_w* family was added without updating the
+        # static table. Refuse rather than silently returning the wrong value.
+        raise ValueError(
+            f"Cannot infer b for {cond!r}: condition is in the fixed_w family "
+            f"but not in post_analysis._STATIC_PHASE_A_GRID. Add it to the "
+            f"static table (and composer.PHASE_A_GRID) before running analysis."
+        )
     if cond.startswith("patch_") or cond.startswith("corrupt_"):
         # Phase B compose_meta.b == 8 by construction.
         return 8

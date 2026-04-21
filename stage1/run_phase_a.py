@@ -28,6 +28,11 @@ import yaml
 
 # D5: absolute imports — invoke via python -m stage1.run_phase_a
 from stage1.utils.config import load_config, setup_logging
+from stage1.utils.manifest_parity import (
+    extract_parity_block,
+    check_manifest_parity_or_raise,
+    load_manifest_from_run_dir,
+)
 from stage1.data.loader import load_mgsm
 from stage1.models.composer import (
     load_models,
@@ -314,11 +319,14 @@ def _check_grid_intersection(rows: List[Dict], run_dir: str) -> None:
 def _load_reused_no_swap(
     reuse_dir: str,
     samples: List[Dict],
+    config=None,
 ) -> Tuple[Dict[str, torch.Tensor], List[Dict], List[float]]:
     """Load precomputed no_swap hidden states + parsed results from a prior run dir.
 
     Returns (hs_dict, parsed_results, per_sample_correct).
-    Raises if required files are missing or sample IDs don't line up.
+    Raises if required files are missing, sample IDs don't line up, or
+    manifest parity fails (RED LIGHT P2: sample-ID match alone is NOT
+    sufficient).
     """
     hs_path = os.path.join(reuse_dir, "hidden_states_no_swap.pt")
     results_path = os.path.join(reuse_dir, "results_no_swap.jsonl")
@@ -327,6 +335,24 @@ def _load_reused_no_swap(
         raise FileNotFoundError(f"Missing {hs_path}")
     if not os.path.exists(results_path):
         raise FileNotFoundError(f"Missing {results_path}")
+
+    # Manifest parity check (RED LIGHT P2): validate model, dataset, and
+    # generation config match before trusting reused artifacts.
+    manifest_path = os.path.join(reuse_dir, "manifest.json")
+    if config is not None and os.path.exists(manifest_path):
+        reuse_manifest = load_manifest_from_run_dir(reuse_dir)
+        current_parity = extract_parity_block(config, sample_ids=[s["sample_id"] for s in samples])
+        check_manifest_parity_or_raise(
+            reuse_manifest, current_parity,
+            source_path=manifest_path,
+            target_desc="current Phase A config",
+        )
+        print(f"  Manifest parity check PASSED for reuse dir: {reuse_dir}")
+    elif config is not None:
+        raise FileNotFoundError(
+            f"No manifest.json in reuse dir {reuse_dir}. Cannot verify "
+            f"manifest parity — refusing to reuse (RED LIGHT P2)."
+        )
 
     hs_dict = torch.load(hs_path, map_location="cpu")
     parsed_results: List[Dict] = []
@@ -419,7 +445,7 @@ def run_phase_a(
     reused_no_swap: Optional[Tuple[Dict[str, torch.Tensor], List[Dict], List[float]]] = None
     if reuse_no_swap_dir is not None:
         print(f"\nReusing precomputed no_swap from: {reuse_no_swap_dir}")
-        reused_no_swap = _load_reused_no_swap(reuse_no_swap_dir, samples)
+        reused_no_swap = _load_reused_no_swap(reuse_no_swap_dir, samples, config=config)
         print(f"  Loaded {len(reused_no_swap[0])} hidden-state entries + "
               f"{len(reused_no_swap[1])} parsed results")
 
@@ -749,6 +775,12 @@ def run_phase_a(
         "baseline_accuracy": round(baseline_acc, 4),
         "conditions": [c[0] for c in conditions],
         "metadata": all_metadata,
+        # RED LIGHT P2: embed parity block for downstream manifest checks.
+        # v4 P2: include sample_regime so cross-phase anchor reuse cannot be
+        # claimed across debug/full or differently-ordered sample regimes.
+        "parity": extract_parity_block(
+            config, sample_ids=[s["sample_id"] for s in samples],
+        ),
     }
 
     with open(os.path.join(run_dir, "manifest.json"), "w") as f:

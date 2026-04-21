@@ -1,6 +1,8 @@
 models:
   recipient: "Qwen/Qwen2.5-1.5B-Instruct"
   donor: "Qwen/Qwen2.5-1.5B"
+  recipient_revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"   # pinned SHA
+  donor_revision: "8faed761d45a263340a0528343f099c05c9a4323"       # pinned SHA
 
 boundary_grid: [8]
 t_fixed: 20

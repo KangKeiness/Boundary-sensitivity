@@ -338,8 +338,8 @@ def test_phase_c_cli_sanity_end_to_end_against_fixture():
             f"  expected: {SPEC_HEADER_LITERAL!r}"
         )
         assert SPEC_HEADER_LITERAL in txt_body
-        # acc_cross_check_tolerance recorded in environment (watcher nit #3).
-        assert summary["environment"]["acc_cross_check_tolerance"] == 2e-3
+        # acc_cross_check_tolerance recorded in environment (RED LIGHT Fix D: tightened).
+        assert summary["environment"]["acc_cross_check_tolerance"] == 5e-5
 
         # Determinism: second invocation should produce bytewise-equal CSV.
         run_dir2 = run_phase_c(

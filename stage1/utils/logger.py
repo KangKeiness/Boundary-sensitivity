@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from stage1.utils.manifest_parity import extract_parity_block
+
 
 def create_run_dir(base_dir: str = "stage1/outputs") -> str:
     """Create a timestamped run directory."""
@@ -93,6 +95,9 @@ def save_manifest(
             "models": {
                 "recipient": config.models.recipient,
                 "donor":     config.models.donor,
+                # RED LIGHT Fix B: include revision fields for manifest parity.
+                "recipient_revision": getattr(config.models, "recipient_revision", None),
+                "donor_revision":     getattr(config.models, "donor_revision", None),
             },
             "boundary_grid": config.boundary_grid,
             "t_fixed":       config.t_fixed,
@@ -136,6 +141,12 @@ def save_manifest(
         manifest["hidden_state_layer_count"] = hidden_state_info.get("layer_count")
         manifest["hidden_state_shape"]       = hidden_state_info.get("shape")
         manifest["hidden_state_dtype"]       = hidden_state_info.get("dtype")
+
+    # v4 P2: embed canonical parity block (with sample_regime) so Stage 1
+    # manifests are interchangeable with Phase A/B's parity contract. The
+    # legacy ``config`` block is kept for backward compatibility with older
+    # post-analysis code that reads it directly.
+    manifest["parity"] = extract_parity_block(config, sample_ids=sample_ids)
 
     path = os.path.join(run_dir, "manifest.json")
     with open(path, "w") as f:

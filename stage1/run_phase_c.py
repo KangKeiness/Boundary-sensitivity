@@ -81,6 +81,11 @@ def _resolve_phase_b_run(explicit: Optional[str]) -> str:
     If ``explicit`` is given, use it (after absolute-path resolution). Else,
     pick the lexicographically-latest ``run_*`` directory under the Phase B
     outputs folder. Raises ``RuntimeError`` if none exist.
+
+    NOTE: this only resolves the path. Upstream validity gating
+    (``run_status == "passed"``) is a separate explicit check applied by
+    ``_assert_phase_b_passed`` so that the gate decision is auditable in
+    isolation and tested without the full Phase C pipeline.
     """
     if explicit:
         resolved = str(pathlib.Path(explicit).resolve())
@@ -96,6 +101,92 @@ def _resolve_phase_b_run(explicit: Optional[str]) -> str:
         f"No Phase B runs found under {_phase_b_outputs_dir()}; "
         "pass --phase-b-run explicitly."
     )
+
+
+# ─── Upstream-validity gate (v4 PRIORITY 1) ─────────────────────────────────
+#
+# Phase C must NOT silently consume a failed Phase B run. We hard-fail unless
+# ``phase_b_summary.run_status == "passed"`` (or the explicit override flag is
+# set). The gate is its own helper so it is unit-testable without invoking the
+# rest of the Phase C pipeline.
+
+
+_VALID_UPSTREAM_STATUS: str = "passed"
+
+
+class FailedUpstreamError(RuntimeError):
+    """Raised when Phase C is asked to consume a non-passed Phase B run."""
+
+
+def _assert_phase_b_passed(
+    phase_b_run_dir: str,
+    *,
+    allow_failed_upstream: bool = False,
+) -> Dict[str, Any]:
+    """Validate that the Phase B run at ``phase_b_run_dir`` is safe to consume.
+
+    Returns the loaded ``phase_b_summary.json`` dict on success.
+
+    Hard-fails by default (``FailedUpstreamError``) when:
+      - ``phase_b_summary.json`` is missing
+      - ``run_status`` field is absent (legacy Phase B run pre-dates v3 P3 —
+        unverifiable, so refuse)
+      - ``run_status != "passed"``
+
+    The single escape hatch is ``allow_failed_upstream=True`` (CLI:
+    ``--allow-failed-upstream``). When set, the function logs a loud warning
+    and returns the summary anyway. Callers that pass this flag are
+    responsible for embedding the override into Phase C's own summary so the
+    decision is auditable downstream.
+    """
+    summary_path = os.path.join(phase_b_run_dir, "phase_b_summary.json")
+    if not os.path.exists(summary_path):
+        raise FailedUpstreamError(
+            f"Refusing to consume Phase B run {phase_b_run_dir!r}: "
+            f"phase_b_summary.json not found. The run is incomplete."
+        )
+    try:
+        with open(summary_path, encoding="utf-8") as f:
+            pb_summary = json.load(f)
+    except Exception as exc:
+        raise FailedUpstreamError(
+            f"Refusing to consume Phase B run {phase_b_run_dir!r}: "
+            f"phase_b_summary.json is unreadable ({exc!r})."
+        ) from exc
+
+    status = pb_summary.get("run_status")
+    failure_reason = pb_summary.get("failure_reason")
+
+    if status is None:
+        # Legacy Phase B run pre-dates the v3 P3 run-status field.
+        # Cannot prove it is valid — refuse by default.
+        msg = (
+            f"Refusing to consume Phase B run {phase_b_run_dir!r}: "
+            f"phase_b_summary.json has no `run_status` field. The run "
+            f"pre-dates the v3 P3 run-status convention; re-run Phase B "
+            f"so the gate result is recorded. "
+            f"(Override: --allow-failed-upstream — debugging only.)"
+        )
+        if not allow_failed_upstream:
+            raise FailedUpstreamError(msg)
+        logger.warning("UPSTREAM-GATE OVERRIDDEN — %s", msg)
+        return pb_summary
+
+    if status != _VALID_UPSTREAM_STATUS:
+        msg = (
+            f"Refusing to consume Phase B run {phase_b_run_dir!r}: "
+            f"upstream run_status={status!r} (expected {_VALID_UPSTREAM_STATUS!r})"
+            + (f", failure_reason={failure_reason!r}" if failure_reason else "")
+            + ". A failed Phase B run produces methodologically invalid "
+            "decomposition. Re-run Phase B until run_status='passed'. "
+            "(Override: --allow-failed-upstream — debugging only.)"
+        )
+        if not allow_failed_upstream:
+            raise FailedUpstreamError(msg)
+        logger.warning("UPSTREAM-GATE OVERRIDDEN — %s", msg)
+        return pb_summary
+
+    return pb_summary
 
 
 def _create_run_dir(run_name: Optional[str]) -> str:
@@ -143,12 +234,9 @@ _CSV_COLUMNS: Tuple[str, ...] = (
     "restoration_proportion_ci_hi",
     "restoration_proportion_ci_reason",
     "total_effect",
-    # NIE/NDE/TE/MP aliases — audit-only columns for cross-audience mapping.
-    # Phase C prose MUST NOT use these terms (FORBIDDEN_PHRASES_PHASE_C gate).
-    "alias_NIE",
-    "alias_NDE",
-    "alias_TE",
-    "alias_MP",
+    # RED LIGHT P5: alias_NIE/NDE/TE/MP columns REMOVED to eliminate formal
+    # mediation terminology risk. Use only conservative terms:
+    # restoration_effect, residual_effect, restoration_proportion.
     "n_aligned",
     "is_best_condition",
     "methodology",
@@ -203,10 +291,6 @@ def _write_decomposition_csv(
         row["restoration_proportion_ci_hi"] = _fmt(r.get("restoration_proportion_ci_hi"))
         row["restoration_proportion_ci_reason"] = _fmt(r.get("restoration_proportion_ci_reason"))
         row["total_effect"] = _fmt(r.get("total_effect"))
-        row["alias_NIE"] = _fmt(r.get("alias_NIE"))
-        row["alias_NDE"] = _fmt(r.get("alias_NDE"))
-        row["alias_TE"] = _fmt(r.get("alias_TE"))
-        row["alias_MP"] = _fmt(r.get("alias_MP"))
         # Best-condition block (from paired-bootstrap on best vs clean/no_patch)
         # overrides the per-condition row for the best pick — keeps the canonical
         # "best-condition" numbers identical to summary.json.
@@ -267,8 +351,8 @@ def _build_summary_json(
     proportion = table["proportion"]
 
     # Mirror CSV rows as JSON decomposition table (typed, not formatted).
-    # Now includes per-condition residual_effect / restoration_proportion
-    # (spec §11.2 updated — reviewer Phase C 4a) plus NIE/NDE/TE/MP aliases.
+    # Includes per-condition residual_effect / restoration_proportion
+    # (spec §11.2 updated). RED LIGHT P5: alias columns removed.
     decomposition_table: List[Dict[str, Any]] = []
     for r in table["rows"]:
         is_best = r["condition"] == best
@@ -305,10 +389,6 @@ def _build_summary_json(
             "restoration_proportion_ci_hi": proportion_hi,
             "restoration_proportion_ci_reason": proportion_reason,
             "total_effect": r.get("total_effect"),
-            "alias_NIE": r.get("alias_NIE"),
-            "alias_NDE": r.get("alias_NDE"),
-            "alias_TE": r.get("alias_TE"),
-            "alias_MP": r.get("alias_MP"),
             "n_aligned": r.get("n_aligned"),
             "is_best_condition": is_best,
             "methodology": _METHODOLOGY_TAG,
@@ -331,9 +411,10 @@ def _build_summary_json(
         "phase_b_run_path": phase_b_run_dir,
         "phase_b_summary_sha256": provenance["phase_b_summary_sha256"],
         # Tolerance used by _cross_check_accuracies against phase_b_summary.json.
-        # Loosened from spec §10's 1e-6 because Phase B writes 4-decimal-rounded
-        # accuracies; recorded here for downstream traceability.
-        "acc_cross_check_tolerance": 2e-3,
+        # RED LIGHT Fix D: tightened from 2e-3 to 5e-5. Phase B rounds to 4
+        # decimals; max rounding error is 5e-5. Anything beyond that is a real
+        # mismatch.
+        "acc_cross_check_tolerance": 5e-5,
     }
 
     summary: Dict[str, Any] = {
@@ -375,6 +456,14 @@ def _build_summary_json(
         "dataset": dataset,
         "forbidden_phrases_gate": [],  # filled after gate runs
         "claim_eligible_conditions": list(CLAIM_ELIGIBLE_CONDITIONS),
+        # RED LIGHT P6: post-selection caution.
+        "best_condition_selection_note": (
+            "Best condition selected via argmax over restoration_effect among "
+            "claim-eligible conditions. This is a descriptive / exploratory "
+            "pick, NOT a confirmatory winner inference. The CI reflects "
+            "bootstrap variability of the selected condition, NOT a "
+            "multiplicity-adjusted comparison."
+        ),
     }
     return summary
 
@@ -448,6 +537,15 @@ def _write_summary_txt(path: str, summary: Dict[str, Any]) -> None:
         "restoration intervention only. No formal identification of direct or "
         "indirect pathways is attempted; causal claims remain outside scope.",
         "",
+        "Post-selection note (RED LIGHT P6): the 'best condition' is selected "
+        "via argmax over restoration_effect among claim-eligible conditions. "
+        "This is a descriptive / exploratory pick, NOT a confirmatory winner "
+        "inference. The associated CI reflects bootstrap variability of the "
+        "selected condition's delta, NOT a multiplicity-adjusted comparison "
+        "across all conditions. All conditions are reported above; interpret "
+        "the best-condition row as a summary convenience, not a significance "
+        "claim.",
+        "",
     ]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -464,20 +562,39 @@ def run_phase_c(
     seed: int = 0,
     ci: float = 0.95,
     run_name: Optional[str] = None,
+    allow_failed_upstream: bool = False,
 ) -> str:
     """Run Phase C mediation-style decomposition analysis.
 
     Returns:
         Absolute path to the Phase C run directory.
+
+    v4 P1 — strict upstream gate:
+        Default behavior hard-fails (FailedUpstreamError) unless the resolved
+        Phase B run reports ``run_status == "passed"`` in its
+        ``phase_b_summary.json``. Set ``allow_failed_upstream=True`` (CLI
+        ``--allow-failed-upstream``) only for explicit debugging — the
+        override is logged and embedded into the Phase C summary.
     """
     # Seed numpy (analysis-only; no torch RNG touched here).
     np.random.seed(seed)
 
     phase_b_run_dir = _resolve_phase_b_run(phase_b_run)
+    # v4 P1: hard-fail on non-passed upstream BEFORE creating any output dir or
+    # running expensive analysis. The gate raises if the upstream is invalid.
+    pb_summary_for_gate = _assert_phase_b_passed(
+        phase_b_run_dir, allow_failed_upstream=allow_failed_upstream,
+    )
+    upstream_status = pb_summary_for_gate.get("run_status")
+
     run_dir = _create_run_dir(run_name)
 
     print("Phase C \u2014 mediation-style decomposition (prompt-side only)")
     print(f"  Phase B run : {phase_b_run_dir}")
+    print(f"  Upstream    : run_status={upstream_status!r}"
+          + (" [OVERRIDE: --allow-failed-upstream]"
+             if allow_failed_upstream and upstream_status != _VALID_UPSTREAM_STATUS
+             else ""))
     print(f"  Sanity mode : {sanity}")
     print(f"  Seed        : {seed}")
     print(f"  Bootstrap N : {bootstrap_n}")
@@ -503,6 +620,8 @@ def run_phase_c(
         bootstrap_n=bootstrap_n,
         seed=seed,
         ci=ci,
+        # RED LIGHT Fix C: in non-sanity mode, require exact sample-ID equality.
+        strict_sample_ids=(not sanity),
     )
 
     csv_path = os.path.join(run_dir, "phase_c_decomposition_table.csv")
@@ -521,6 +640,15 @@ def run_phase_c(
         run_name=run_name,
         sanity=sanity,
     )
+
+    # v4 P1: record upstream-gate decision in the Phase C summary so the
+    # provenance is auditable. The override path is loud and explicit.
+    summary["upstream_gate"] = {
+        "phase_b_run_status": upstream_status,
+        "phase_b_failure_reason": pb_summary_for_gate.get("failure_reason"),
+        "allow_failed_upstream": bool(allow_failed_upstream),
+        "passed_default_gate": (upstream_status == _VALID_UPSTREAM_STATUS),
+    }
 
     # Write the summary JSON first WITHOUT the gate result so the gate can
     # read it; then re-write with the gate populated.
@@ -570,7 +698,14 @@ def run_phase_c(
 
 
 def _cross_check_accuracies(summary: Dict[str, Any], phase_b_run_dir: str) -> None:
-    """Tolerance-check acc_no_patch / acc_clean_no_patch vs. Phase B summary."""
+    """Reconcile acc_no_patch / acc_clean_no_patch vs. Phase B summary.
+
+    RED LIGHT Fix D: prefer exact numerator/denominator count reconciliation.
+    Phase C computes accuracies from the same JSONLs that Phase B wrote, so
+    on the same sample set the counts MUST match exactly. If Phase B summary
+    records 4-decimal-rounded values, use a tight tolerance (5e-5) rather than
+    the previous overly-loose 2e-3.
+    """
     pb_path = os.path.join(phase_b_run_dir, "phase_b_summary.json")
     if not os.path.exists(pb_path):
         return
@@ -584,23 +719,35 @@ def _cross_check_accuracies(summary: Dict[str, Any], phase_b_run_dir: str) -> No
             "'clean_baseline_accuracy'. Phase B schema has drifted; "
             "update Phase C cross-check to the new key names."
         )
-    tol = 2e-3  # Phase B rounds to 4 decimals, so a rounded match is within 5e-5;
-                # Phase B can also have been run on a different dataset ordering,
-                # so we use the same 2e-3 tolerance used in phase_b_summary's
-                # phase_a_cross_check scale. Below this, raise.
+    # RED LIGHT Fix D: tightened tolerance.
+    # Phase B rounds accuracies to 4 decimals (e.g., 0.3200). Phase C recomputes
+    # from the same JSONL files, so on identical sample sets the true accuracy
+    # is identical. The only source of difference is Phase B's rounding.
+    # A 4-decimal round can shift by at most 5e-5. Use that as the tight bound.
+    # Previous value was 2e-3 which could mask genuine mismatches.
+    tol = 5e-5
     if pb_no_patch is not None:
         diff = abs(summary["acc_no_patch"] - float(pb_no_patch))
         if diff > tol:
+            # Provide detailed diagnostics.
             raise RuntimeError(
-                f"acc_no_patch mismatch vs phase_b_summary: "
-                f"{summary['acc_no_patch']} vs {pb_no_patch} (|Δ|={diff:.6f} > {tol})"
+                f"acc_no_patch reconciliation FAILED vs phase_b_summary.\n"
+                f"  Phase C computed: {summary['acc_no_patch']:.8f}\n"
+                f"  Phase B recorded: {pb_no_patch}\n"
+                f"  |Δ| = {diff:.8f} > tolerance {tol}\n"
+                f"  This indicates either a sample-set mismatch or a computation "
+                f"  bug. Phase C must compute on the exact same samples as Phase B."
             )
     if pb_clean is not None:
         diff = abs(summary["acc_clean_no_patch"] - float(pb_clean))
         if diff > tol:
             raise RuntimeError(
-                f"acc_clean_no_patch mismatch vs phase_b_summary: "
-                f"{summary['acc_clean_no_patch']} vs {pb_clean} (|Δ|={diff:.6f} > {tol})"
+                f"acc_clean_no_patch reconciliation FAILED vs phase_b_summary.\n"
+                f"  Phase C computed: {summary['acc_clean_no_patch']:.8f}\n"
+                f"  Phase B recorded: {pb_clean}\n"
+                f"  |Δ| = {diff:.8f} > tolerance {tol}\n"
+                f"  This indicates either a sample-set mismatch or a computation "
+                f"  bug. Phase C must compute on the exact same samples as Phase B."
             )
 
 
@@ -636,6 +783,15 @@ def main() -> None:
         help="Sanity mode: require only clean_no_patch, restoration_no_patch, "
              "and restoration_patch_recovery_full.",
     )
+    parser.add_argument(
+        "--allow-failed-upstream", action="store_true",
+        help=(
+            "DEBUG-ONLY override: consume the Phase B run even when its "
+            "phase_b_summary.run_status != 'passed'. Default behavior hard-fails "
+            "to prevent invalid upstream evidence from propagating. The override "
+            "is recorded in the Phase C summary's `upstream_gate` block."
+        ),
+    )
     # --config is not used by Phase C (analysis-only, no model/dataset config);
     # accept-and-ignore for cross-phase CLI consistency.
     parser.add_argument(
@@ -657,6 +813,7 @@ def main() -> None:
         seed=args.seed,
         ci=args.ci,
         run_name=args.run_name,
+        allow_failed_upstream=args.allow_failed_upstream,
     )
 
 

@@ -5,6 +5,8 @@
   "reference_condition": "no_swap",
   "t_fixed": 20,
   "seed": 42,
+  "run_status": "passed",
+  "failure_reason": null,
   "no_patch_accuracy": 0.125,
   "clean_baseline_accuracy": 0.5,
   "dataset": {

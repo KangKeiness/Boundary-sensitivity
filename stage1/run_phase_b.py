@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
-import glob
 import hashlib
 import json
 import logging
@@ -42,6 +41,19 @@ import transformers
 
 from stage1.utils.config import load_config, setup_logging
 from stage1.utils.logger import create_run_dir
+from stage1.utils.manifest_parity import extract_parity_block
+from stage1.utils.anchor_gate import (
+    ANCHOR_WORKFLOW_DOC,
+    PHASE_A_CROSS_CHECK_TOL,
+    evaluate_phase_b_anchor_gate,
+    render_anchor_gate_diagnostic,
+)
+from stage1.utils.run_status import (
+    RUN_STATUS_FAILED,
+    RUN_STATUS_PASSED,
+    RUN_STATUS_PENDING,
+    write_phase_b_status_artifacts,
+)
 from stage1.utils.wording import FORBIDDEN_PHRASES, check_artifacts_for_forbidden
 from stage1.data.loader import load_mgsm
 from stage1.models.composer import load_models, compose_model
@@ -60,8 +72,10 @@ logger = logging.getLogger(__name__)
 # Effect-size threshold for the comparative sentence gate (spec §7, §11.10).
 EPSILON_DELTA: float = 0.02
 
-# Cross-phase accuracy tolerance (2/250 samples).
-PHASE_A_CROSS_CHECK_TOL: float = 0.008
+# Cross-phase accuracy tolerance (2/250 samples). Authoritative definition lives
+# in ``stage1/utils/anchor_gate.py``; re-exported here for backward-compat with
+# tests and call sites that imported it from this module.
+# (PHASE_A_CROSS_CHECK_TOL is imported above.)
 
 # Canonical methodological-constraint string (contains "prompt-side" per spec §11.2).
 METHODOLOGICAL_CONSTRAINT: str = (
@@ -121,95 +135,27 @@ def _state_dict_sha256(model: torch.nn.Module) -> str:
 
 
 # ─── Phase A cross-check loader ──────────────────────────────────────────────
+# The actual loader / parity-filter / decision logic lives in
+# ``stage1/utils/anchor_gate.py`` (torch-free) so that integration-level
+# regression tests can exercise it end-to-end. The thin wrappers below preserve
+# the original module-level CWD-invariant resolution for callers that imported
+# them by name.
+
 
 def _phase_a_outputs_dir() -> str:
     """Resolve the Phase A outputs directory relative to the repo root.
 
-    Uses ``pathlib`` resolution from this file's location rather than CWD, so
-    the spec §11.7 cross-check is invariant to how the entrypoint is launched
-    (``python -m stage1.run_phase_b`` vs. ``python stage1/run_phase_b.py`` vs.
-    scheduled job with arbitrary CWD). Spec §11.7.
+    CWD-invariant per spec §11.7. Delegates to the canonical resolver in
+    ``stage1.utils.anchor_gate``.
     """
-    import pathlib
-    return str(
-        pathlib.Path(__file__).resolve().parents[1] / "stage1" / "outputs" / "phase_a"
-    )
-
-
-def _load_latest_phase_a_summary() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Return (summary_dict, resolved_path) or (None, None) if no match.
-
-    The dataset manifest block and ``hard_swap_b8`` / ``no_swap`` accuracies
-    are read from this artifact (spec §4, §7). The path is resolved relative
-    to the repo root (NOT CWD) so the §11.7 acceptance check is deterministic.
-    """
-    pattern = os.path.join(_phase_a_outputs_dir(), "run_*", "phase_a_summary.json")
-    candidates = sorted(glob.glob(pattern), reverse=True)
-    for path in candidates:
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f), path
-        except Exception:
-            continue
-    return None, None
+    from stage1.utils.anchor_gate import default_phase_a_outputs_dir
+    return default_phase_a_outputs_dir()
 
 
 def _stage1_outputs_dir() -> str:
-    """Resolve the Stage 1 sweep outputs dir (``stage1/outputs/run_*``).
-
-    Stage 1 runs include the original ``hard_swap_b8`` condition at (b=8, t=20),
-    which Phase A's confound grid does NOT contain (Phase A uses fixed_w4_posN /
-    fixed_b8_wN). The treatment-parity cross-check (no_patch ~ hard_swap_b8)
-    therefore must fall back to Stage 1 artifacts when Phase A lacks the anchor.
-    """
-    import pathlib
-    return str(pathlib.Path(__file__).resolve().parents[1] / "stage1" / "outputs")
-
-
-def _load_latest_stage1_hard_swap_b8() -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Return ``(hard_swap_b8_accuracy, no_swap_accuracy, evaluation_path)``.
-
-    Searches ``stage1/outputs/run_*/evaluation.json`` in reverse-chronological
-    order (newest first) for a run containing a ``hard_swap_b8`` row. Returns
-    ``(None, None, None)`` if no matching run exists.
-    """
-    pattern = os.path.join(_stage1_outputs_dir(), "run_*", "evaluation.json")
-    candidates = sorted(glob.glob(pattern), reverse=True)
-    for path in candidates:
-        try:
-            with open(path, encoding="utf-8") as f:
-                eval_dict = json.load(f)
-        except Exception:
-            continue
-        accs = eval_dict.get("accuracies") or {}
-        hs = accs.get("hard_swap_b8")
-        ns = accs.get("no_swap")
-        hs_acc = float(hs["accuracy"]) if isinstance(hs, dict) and hs.get("accuracy") is not None else None
-        ns_acc = (
-            float(ns["accuracy"]) if isinstance(ns, dict) and ns.get("accuracy") is not None
-            else (float(eval_dict["baseline_accuracy"]) if eval_dict.get("baseline_accuracy") is not None else None)
-        )
-        if hs_acc is not None:
-            return hs_acc, ns_acc, path
-    return None, None, None
-
-
-def _phase_a_condition_accuracy(summary: Dict[str, Any], condition: str) -> Optional[float]:
-    """Pull accuracy for a named condition from a Phase A summary dict."""
-    # Phase A emits per-condition rows under ``all_conditions``.
-    rows = summary.get("all_conditions") or []
-    for row in rows:
-        if row.get("condition") == condition:
-            val = row.get("accuracy")
-            if val is None:
-                continue
-            return float(val)
-    # Baseline fallback: ``baseline_accuracy`` is no_swap.
-    if condition == "no_swap":
-        val = summary.get("baseline_accuracy")
-        if val is not None:
-            return float(val)
-    return None
+    """Resolve the Stage 1 sweep outputs dir (``stage1/outputs/run_*``)."""
+    from stage1.utils.anchor_gate import default_stage1_outputs_dir
+    return default_stage1_outputs_dir()
 
 
 # ─── Paired bootstrap for comparative-sentence gate ──────────────────────────
@@ -483,43 +429,47 @@ def run_phase_b(
     # We therefore source hard_swap_b8 from the latest Stage 1 sweep run
     # (stage1/outputs/run_*/evaluation.json) and fall back to Phase A only for
     # the no_swap baseline.
-    phase_a, phase_a_path = _load_latest_phase_a_summary()
-    phase_a_hard_swap_acc: Optional[float] = None
-    phase_a_no_swap_acc: Optional[float] = None
-    if phase_a is not None:
-        phase_a_hard_swap_acc = _phase_a_condition_accuracy(phase_a, "hard_swap_b8")
-        phase_a_no_swap_acc = _phase_a_condition_accuracy(phase_a, "no_swap")
-
-    stage1_hs_acc, stage1_ns_acc, stage1_eval_path = _load_latest_stage1_hard_swap_b8()
-
-    # Prefer Stage 1 anchor for hard_swap_b8 (Phase A normally lacks it).
-    anchor_hard_swap_acc: Optional[float] = (
-        phase_a_hard_swap_acc if phase_a_hard_swap_acc is not None else stage1_hs_acc
+    # RED LIGHT P2: anchor selection filtered by manifest parity.
+    # YELLOW-LIGHT v3 P1: gate decision delegated to ``utils.anchor_gate`` so
+    # full integration-level regression tests can exercise it end-to-end.
+    # v4 P2: include sample_regime in the parity block so anchors with a
+    # different debug/full mode, sample count, or sample ordering are rejected.
+    current_parity = extract_parity_block(
+        config, sample_ids=[s["sample_id"] for s in samples],
     )
-    anchor_no_swap_acc: Optional[float] = (
-        phase_a_no_swap_acc if phase_a_no_swap_acc is not None else stage1_ns_acc
+    gate = evaluate_phase_b_anchor_gate(
+        no_patch_acc=no_patch_acc,
+        clean_baseline_acc=clean_baseline_acc,
+        sanity=sanity,
+        current_parity=current_parity,
+        tolerance=PHASE_A_CROSS_CHECK_TOL,
+        phase_a_dir=_phase_a_outputs_dir(),
+        stage1_dir=_stage1_outputs_dir(),
     )
-    anchor_hard_swap_source: Optional[str] = (
-        "phase_a" if phase_a_hard_swap_acc is not None
-        else ("stage1" if stage1_hs_acc is not None else None)
-    )
-    anchor_no_swap_source: Optional[str] = (
-        "phase_a" if phase_a_no_swap_acc is not None
-        else ("stage1" if stage1_ns_acc is not None else None)
-    )
-
-    cross_check_passed: Optional[bool] = None
-    deltas_ok: List[bool] = []
-    if anchor_hard_swap_acc is not None:
-        deltas_ok.append(
-            abs(no_patch_acc - anchor_hard_swap_acc) <= PHASE_A_CROSS_CHECK_TOL
-        )
-    if anchor_no_swap_acc is not None:
-        deltas_ok.append(
-            abs(clean_baseline_acc - anchor_no_swap_acc) <= PHASE_A_CROSS_CHECK_TOL
-        )
-    if deltas_ok:
-        cross_check_passed = all(deltas_ok)
+    # Local aliases mirror the legacy variables so the rest of this function
+    # (summary block, sanity-check labels) reads identically to before.
+    phase_a_path = gate.phase_a_summary_path
+    phase_a_hard_swap_acc = gate.phase_a_hard_swap_b8_accuracy
+    phase_a_no_swap_acc = gate.phase_a_no_swap_accuracy
+    stage1_eval_path = gate.stage1_evaluation_path
+    stage1_hs_acc = gate.stage1_hard_swap_b8_accuracy
+    stage1_ns_acc = gate.stage1_no_swap_accuracy
+    anchor_hard_swap_acc = gate.anchor_hard_swap_b8_accuracy
+    anchor_no_swap_acc = gate.anchor_no_swap_accuracy
+    anchor_hard_swap_source = gate.anchor_hard_swap_source
+    anchor_no_swap_source = gate.anchor_no_swap_source
+    cross_check_passed = gate.passed
+    cross_check_missing_anchors = list(gate.missing_anchors)
+    cross_check_failed_anchors = list(gate.failed_anchors)
+    # Re-load the Phase A summary dict for the dataset-mirror block below.
+    # (We don't reuse the loader; the path is enough.)
+    phase_a: Optional[Dict[str, Any]] = None
+    if phase_a_path is not None:
+        try:
+            with open(phase_a_path, encoding="utf-8") as _f:
+                phase_a = json.load(_f)
+        except Exception:
+            phase_a = None
 
     # (13) Environment block.
     env_block: Dict[str, Any] = {
@@ -534,6 +484,8 @@ def run_phase_b(
         "deterministic_algorithms_enabled": True,
         "determinism_warnings": determinism_warnings,
         "seed": seed,
+        # RED LIGHT P4: record generation config for decode-budget traceability.
+        "generation_config": gen_config,
     }
 
     # (14) Build summary JSON.
@@ -562,29 +514,14 @@ def run_phase_b(
         "restoration_table": restoration_table,
         "corruption_table": corruption_table,
         "methodological_constraint": METHODOLOGICAL_CONSTRAINT,
-        "phase_a_cross_check": {
-            "phase_a_summary_path": phase_a_path,
-            "phase_a_outputs_dir": _phase_a_outputs_dir(),
-            "phase_a_hard_swap_b8_accuracy": phase_a_hard_swap_acc,
-            "phase_a_no_swap_accuracy": phase_a_no_swap_acc,
-            "stage1_evaluation_path": stage1_eval_path,
-            "stage1_hard_swap_b8_accuracy": stage1_hs_acc,
-            "stage1_no_swap_accuracy": stage1_ns_acc,
-            "anchor_hard_swap_b8_accuracy": anchor_hard_swap_acc,
-            "anchor_hard_swap_source": anchor_hard_swap_source,
-            "anchor_no_swap_accuracy": anchor_no_swap_acc,
-            "anchor_no_swap_source": anchor_no_swap_source,
-            "tolerance": PHASE_A_CROSS_CHECK_TOL,
-            "passed": cross_check_passed,
-            "note": (
-                "Treatment parity (no_patch ≈ hard_swap_b8) is cross-checked "
-                "against the newest Stage 1 sweep run since Phase A's confound "
-                "grid does not contain hard_swap_b8 at (b=8, t=20)."
-            ),
-        },
+        "phase_a_cross_check": gate.to_summary_dict(
+            phase_a_outputs_dir=_phase_a_outputs_dir(),
+        ),
         "compose_meta": compose_meta,
         "dataset": dataset_block,
         "environment": env_block,
+        # RED LIGHT P2: embed parity block for downstream manifest checks.
+        "parity": current_parity,
     }
 
     # (15) Comparative-sentence gate (spec §7, §11.10).
@@ -651,8 +588,15 @@ def run_phase_b(
         )
     summary["comparative_claim"] = comparative_block
 
-    # (16) Human-readable summary TXT (contains t=20 header and exactly one
-    #      comparative sentence).
+    # YELLOW-LIGHT v3 P3: explicit run-status field. Initialised as "pending"
+    # and updated to "passed" / "failed" by every ``_persist_summary`` call.
+    summary["run_status"] = RUN_STATUS_PENDING
+    summary["failure_reason"] = None
+
+    # (16) Human-readable summary TXT body (contains t=20 header and exactly one
+    #      comparative sentence). The leading status banner is prepended by
+    #      ``write_phase_b_status_artifacts`` on each persist, so a failed run
+    #      cannot be mistaken for a passed one by a human glancing at the file.
     lines: List[str] = [
         "=" * 60,
         "PHASE B — RESTORATION INTERVENTION RESULTS",
@@ -703,7 +647,8 @@ def run_phase_b(
         "establish a complete mechanism; scientific claims remain conservative.",
         "",
     ]
-    summary_text = "\n".join(lines)
+    body_lines = list(lines)  # banner-free TXT body, used by every persist call
+    summary_text = "\n".join(body_lines)
     print(summary_text)
 
     # (17) Record state_dict hash AFTER all inference passes.
@@ -716,11 +661,18 @@ def run_phase_b(
             "In-place weight mutation is forbidden."
         )
 
-    # (18) Write JSON + TXT.
-    with open(os.path.join(run_dir, "phase_b_summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    with open(os.path.join(run_dir, "phase_b_summary.txt"), "w", encoding="utf-8") as f:
-        f.write(summary_text)
+    # YELLOW-LIGHT v3 P3: every persist of phase_b_summary.{json,txt} +
+    # RUN_STATUS.txt goes through the centralised helper. This is the ONLY
+    # path that writes those files — there is no flow where a failed run
+    # can leave status="pending"/"passed" artifacts on disk.
+    def _persist_summary(status: str, failure_reason: Optional[str] = None) -> None:
+        write_phase_b_status_artifacts(
+            run_dir, summary, body_lines, status,
+            failure_reason=failure_reason,
+        )
+
+    # (18) Initial write with status="pending" so the wording gate can scan files.
+    _persist_summary(RUN_STATUS_PENDING)
 
     # (19) Conservative-wording gate (spec §11.5). Fail hard on any violation.
     wording_artifacts = [
@@ -734,8 +686,14 @@ def run_phase_b(
         print("\nFATAL: Conservative-wording gate FAILED:")
         for v in wording_violations:
             print(f"  {v}")
+        wording_reason = (
+            "wording_violations: " + " | ".join(wording_violations[:5])
+            + (" (+more)" if len(wording_violations) > 5 else "")
+        )
+        _persist_summary(RUN_STATUS_FAILED, failure_reason=wording_reason)
         raise RuntimeError(
-            "Phase B FAILED: forbidden phrases found in summary artifacts."
+            "Phase B FAILED: forbidden phrases found in summary artifacts. "
+            f"Artifacts updated with run_status='failed'. See {run_dir}/RUN_STATUS.txt."
         )
 
     # (20) Eval-sanity checks (real, not vacuous).
@@ -763,35 +721,68 @@ def run_phase_b(
                    sd_sha_before == sd_sha_after))
 
     # Cross-phase accuracy check — spec §11.7 acceptance criterion.
-    # In sanity mode, the prior Phase A summary may legitimately be absent
-    # (dev-box bootstrap); we allow it there. In a full run, a missing Phase A
-    # summary is an explicit FAIL: we refuse to silently pass an acceptance
-    # criterion by absence.
+    # RED LIGHT Fix A: full runs require BOTH anchors present and passing.
     if cross_check_passed is None:
         if sanity:
             checks.append((
-                "Phase A cross-check skipped (sanity mode, no prior summary)",
+                "Phase A cross-check skipped (sanity mode, no prior anchors required)",
                 True,
             ))
         else:
+            # Full run with missing anchors: hard fail.
+            missing_str = ", ".join(cross_check_missing_anchors)
             checks.append((
-                f"Phase A cross-check FAILED: no phase_a_summary.json found under "
-                f"{_phase_a_outputs_dir()} (spec §11.7 requires a prior Phase A run)",
+                f"Cross-check FAILED: missing anchor(s) [{missing_str}]. "
+                f"Full runs require BOTH hard_swap_b8 and no_swap anchors from "
+                f"a parity-compatible prior run. Searched: "
+                f"{_phase_a_outputs_dir()}, {_stage1_outputs_dir()}",
                 False,
             ))
-    else:
+    elif cross_check_passed:
         checks.append((
-            f"Phase A cross-check within |Δ| ≤ {PHASE_A_CROSS_CHECK_TOL}",
-            cross_check_passed,
+            f"Cross-check PASSED: BOTH anchors within |Δ| ≤ {PHASE_A_CROSS_CHECK_TOL} "
+            f"(hard_swap_b8 from {anchor_hard_swap_source}, "
+            f"no_swap from {anchor_no_swap_source})",
+            True,
+        ))
+    else:
+        # Both present but at least one failed tolerance.
+        failed_str = "; ".join(cross_check_failed_anchors)
+        checks.append((
+            f"Cross-check FAILED: {failed_str}",
+            False,
         ))
 
     for label, ok in checks:
         status = "PASS" if ok else "FAIL"
         print(f"  [{status}] {label}")
 
-    if not all(ok for _, ok in checks):
-        raise RuntimeError("Phase B FAILED sanity checks (see PASS/FAIL list above).")
+    failed_labels = [label for label, ok in checks if not ok]
+    if failed_labels:
+        # YELLOW-LIGHT v3 P3: rewrite artifacts with explicit failure status
+        # BEFORE raising, so a downstream user inspecting the run dir cannot
+        # mistake a failed run for a valid one. Includes the actionable anchor
+        # diagnostic when the failure was a cross-check miss.
+        diag = render_anchor_gate_diagnostic(
+            gate,
+            phase_a_dir=_phase_a_outputs_dir(),
+            stage1_dir=_stage1_outputs_dir(),
+            workflow_doc=ANCHOR_WORKFLOW_DOC,
+        )
+        sanity_reason = (
+            "sanity_check_failed: " + " | ".join(failed_labels[:3])
+            + (f" (+{len(failed_labels) - 3} more)" if len(failed_labels) > 3 else "")
+        )
+        if diag:
+            sanity_reason = f"{sanity_reason}. {diag}"
+        _persist_summary(RUN_STATUS_FAILED, failure_reason=sanity_reason)
+        raise RuntimeError(
+            "Phase B FAILED sanity checks (see PASS/FAIL list above). "
+            f"Artifacts updated with run_status='failed'. See {run_dir}/RUN_STATUS.txt."
+        )
 
+    # All gates passed — finalise artifacts with status="passed".
+    _persist_summary(RUN_STATUS_PASSED)
     print(f"\nPhase B PASSED all sanity checks.")
     print(f"Outputs saved to: {run_dir}")
 
@@ -807,10 +798,29 @@ def run_phase_b(
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase B: Restoration intervention")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Phase B: Restoration intervention. "
+            "Full runs hard-fail unless BOTH the hard_swap_b8 anchor (from a "
+            "parity-compatible Stage 1 run) AND the no_swap anchor (from a "
+            "parity-compatible Phase A or Stage 1 run) are available within "
+            f"tolerance {PHASE_A_CROSS_CHECK_TOL}. See {ANCHOR_WORKFLOW_DOC} "
+            "for the parity contract and the recipe to generate compatible "
+            "anchors."
+        ),
+        epilog=(
+            "Anchor workflow: " + ANCHOR_WORKFLOW_DOC + "\n"
+            "Common cause of 'missing anchor(s)' failure: Stage 1 was run with "
+            "stage1_main.yaml (max_new_tokens=256) instead of stage2_confound.yaml "
+            "(max_new_tokens=512), so the parity filter rejects it."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--config", type=str, required=True,
-        help="Path to Phase B config YAML (required).",
+        help="Path to Phase B config YAML (required). Must match the Stage 1 / "
+             "Phase A anchors' configs in models, dataset, generation, and "
+             "hidden-state pooling — see notes/anchors_workflow.md.",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -822,8 +832,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--sanity", action="store_true",
-        help="Sanity mode: 5 samples x {no_patch, patch_recovery_full, "
-             "clean_no_patch, corrupt_recovery_full}.",
+        help="Sanity mode (development only): 5 samples × "
+             "{no_patch, patch_recovery_full, clean_no_patch, "
+             "corrupt_recovery_full}. Relaxes the anchor gate to best-effort. "
+             "Never use for review or final results.",
     )
     args = parser.parse_args()
     run_phase_b(

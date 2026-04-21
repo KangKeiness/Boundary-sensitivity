@@ -1,6 +1,8 @@
 models:
   recipient: "Qwen/Qwen2.5-1.5B-Instruct"
   donor: "Qwen/Qwen2.5-1.5B"
+  recipient_revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"   # pinned SHA (same as stage2_confound.yaml)
+  donor_revision: "8faed761d45a263340a0528343f099c05c9a4323"       # pinned SHA (same as stage2_confound.yaml)
 
 boundary_grid: [2, 4, 6, 8, 10, 12, 14, 16, 18]
 t_fixed: 20
@@ -25,7 +27,11 @@ dataset:
 generation:
   do_sample: false
   temperature: 0.0
-  max_new_tokens: 256
+  max_new_tokens: 256   # NOTE: this differs from stage2_confound.yaml (512). A Stage 1
+                        # sweep produced with this config will be REJECTED by the Phase B
+                        # manifest-parity filter as a hard_swap_b8 anchor. To produce a
+                        # Phase-B-compatible Stage 1 anchor, run the sweep with
+                        # stage2_confound.yaml instead. See notes/anchors_workflow.md.
 
 evaluation:
   bootstrap_n: 1000
