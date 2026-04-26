@@ -13,6 +13,7 @@ Usage (Jupyter):
 """
 
 import argparse
+import builtins
 import csv
 import gc
 import json
@@ -33,6 +34,12 @@ from stage1.utils.manifest_parity import (
     check_manifest_parity_or_raise,
     load_manifest_from_run_dir,
 )
+from stage1.utils.provenance import build_runtime_provenance
+from stage1.utils.hidden_state_verify import (
+    HiddenStateVerificationError,
+    summarise_reports,
+    verify_hidden_state_artifacts,
+)
 from stage1.data.loader import load_mgsm
 from stage1.models.composer import (
     load_models,
@@ -51,6 +58,47 @@ from stage1.analysis.evaluator import compute_accuracy, exact_match
 from stage1.utils.logger import create_run_dir, save_results, save_hidden_states
 
 logger = logging.getLogger(__name__)
+
+
+_CLI_ASCII_REPLACEMENTS = {
+    "—": "-",
+    "–": "-",
+    "−": "-",
+    "←": "<-",
+    "→": "->",
+    "↔": "<->",
+    "≤": "<=",
+    "≥": ">=",
+    "Δ": "delta",
+    "×": "x",
+    "≡": "==",
+}
+
+
+def _ascii_cli_text(text: str) -> str:
+    out = text
+    for src, dst in _CLI_ASCII_REPLACEMENTS.items():
+        out = out.replace(src, dst)
+    return out.encode("ascii", errors="replace").decode("ascii")
+
+
+def _safe_print(*args, **kwargs):
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "\n")
+    file = kwargs.pop("file", sys.stdout)
+    flush = kwargs.pop("flush", False)
+    if kwargs:
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush, **kwargs)
+    if file not in (sys.stdout, sys.stderr):
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush)
+    msg = sep.join(str(a) for a in args)
+    file.write(_ascii_cli_text(msg) + end)
+    if flush:
+        file.flush()
+
+
+# Keep UTF-8 artifacts intact; sanitize only stdout/stderr for locale-safe CLI.
+print = _safe_print
 
 
 # ─── YAML ↔ code grid assertion (1a) ─────────────────────────────────────────
@@ -198,6 +246,42 @@ def _bootstrap_ci(
     lo_idx = max(0, min(lo_idx, n_resamples - 1))
     hi_idx = max(0, min(hi_idx, n_resamples - 1))
     return (boot_means[lo_idx], boot_means[hi_idx])
+
+
+def _bootstrap_ci_clipped_mean_diff(
+    baseline_correct: List[float],
+    condition_correct: List[float],
+    *,
+    n_resamples: int = 1000,
+    ci: float = 0.95,
+    seed: int = 0,
+) -> Tuple[float, float]:
+    """Bootstrap CI for max(0, mean(baseline_correct - condition_correct)).
+
+    Clipping is applied after each resampled mean difference so the CI estimator
+    matches the degradation point estimator used in tables.
+    """
+    if len(baseline_correct) != len(condition_correct):
+        raise ValueError("baseline_correct and condition_correct must have equal length")
+    n = len(baseline_correct)
+    if n == 0:
+        return (float("nan"), float("nan"))
+
+    rng = _random_module.Random(seed)
+    boot_vals: List[float] = []
+    for _ in range(n_resamples):
+        idxs = [rng.randrange(n) for _ in range(n)]
+        mean_base = sum(baseline_correct[i] for i in idxs) / n
+        mean_cond = sum(condition_correct[i] for i in idxs) / n
+        boot_vals.append(max(0.0, mean_base - mean_cond))
+
+    boot_vals.sort()
+    alpha = 1.0 - ci
+    lo_idx = int(alpha / 2 * n_resamples)
+    hi_idx = int((1.0 - alpha / 2) * n_resamples) - 1
+    lo_idx = max(0, min(lo_idx, n_resamples - 1))
+    hi_idx = max(0, min(hi_idx, n_resamples - 1))
+    return (boot_vals[lo_idx], boot_vals[hi_idx])
 
 
 def _spearman_rho(xs: List[float], ys: List[float]) -> float:
@@ -629,18 +713,21 @@ def run_phase_a(
             "fld_l2":      round(fld["fld_l2"], 4),
         })
 
-        # H1: Bootstrap CI on per-sample degradation and fld_cos
-        # Per-sample degradation = baseline_correct_i - cond_correct_i (clipped to >=0 at mean).
-        # We bootstrap over samples: each resample gives a mean degradation.
+        # H1: Bootstrap CI on degradation and fld_cos
+        # Degradation estimator alignment:
+        #   point = max(0, baseline_acc - condition_acc)
+        #   bootstrap = max(0, mean_resample(baseline_correct - condition_correct))
         per_sample_correct_cond = cond_data["per_sample_correct"]
-        per_sample_degrad = [
-            max(0.0, b_corr - c_corr)
-            for b_corr, c_corr in zip(no_swap_per_sample_correct, per_sample_correct_cond)
-        ]
         # Use a per-condition seed derived from (b, t) for stable, condition-specific bootstrap
         _cond_rd_seed = all_metadata[cond_name].get("rd_seed") or 0
         boot_seed = _cond_rd_seed + 1  # stable, condition-specific
-        degrad_ci = _bootstrap_ci(per_sample_degrad, n_resamples=bootstrap_n, ci=bootstrap_ci_level, seed=boot_seed)
+        degrad_ci = _bootstrap_ci_clipped_mean_diff(
+            no_swap_per_sample_correct,
+            per_sample_correct_cond,
+            n_resamples=bootstrap_n,
+            ci=bootstrap_ci_level,
+            seed=boot_seed,
+        )
         fld_cos_ci = _bootstrap_ci(
             fld["per_sample_fld_cos"],
             n_resamples=bootstrap_n,
@@ -707,7 +794,7 @@ def run_phase_a(
 
     # ── Save CSV tables — column order: condition,b,t,width,accuracy,degradation,fld_cos,fld_l2 (A4) ──
     def _write_csv(path: str, fieldnames: List[str], data: List[Dict]) -> None:
-        with open(path, "w", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             w.writerows(data)
@@ -726,6 +813,11 @@ def run_phase_a(
     except Exception:
         git_sha = "unknown"
 
+    # ── Build runtime provenance block (Stage 1 hardening) ──────────────
+    runtime_provenance = build_runtime_provenance(
+        config=config, config_path=config_path,
+    )
+
     # ── Save JSON summary (A5: must contain primary_metrics_note with PRIMARY and SECONDARY) ──
     summary = {
         "phase": "A",
@@ -737,6 +829,7 @@ def run_phase_a(
         "seed": seed,
         "run_name": run_name,
         "git_sha": git_sha,
+        "runtime_provenance": runtime_provenance,
         "primary_metrics_note": (
             "PRIMARY metrics (directly comparable across all Phase A conditions): "
             "accuracy, degradation, fld_cos, fld_l2. "
@@ -744,6 +837,11 @@ def run_phase_a(
             "SECONDARY/EXPLORATORY metrics (recovery-zone length differs when t varies, "
             "so comparability across Grid 1 conditions is compromised): "
             "Recovery-zone mean metrics (RD_cos, RD_l2, BPD_mean, EBPD_mean, CKA, RSA)."
+        ),
+        "degradation_bootstrap_estimator_note": (
+            "Degradation CI estimator matches the point estimator: compute "
+            "mean(no_swap_correct) - mean(condition_correct) per resample, then "
+            "apply max(0, diff)."
         ),
         "h1_bootstrap_cis": bootstrap_cis,
         "h1_position_spearman": h1_position_spearman,
@@ -756,7 +854,7 @@ def run_phase_a(
         "metadata": {k: v for k, v in all_metadata.items() if k != "no_swap"},
     }
 
-    with open(os.path.join(run_dir, "phase_a_summary.json"), "w") as f:
+    with open(os.path.join(run_dir, "phase_a_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     # ── Save manifest (A6: must include random_donor_seeds) ─────────────
@@ -781,9 +879,13 @@ def run_phase_a(
         "parity": extract_parity_block(
             config, sample_ids=[s["sample_id"] for s in samples],
         ),
+        # Stage 1 hardening (2026-04-25): runtime provenance — git SHA,
+        # torch/transformers/numpy versions, exact CLI command, dataset
+        # revision + realised SHA-256, hostname.
+        "runtime_provenance": runtime_provenance,
     }
 
-    with open(os.path.join(run_dir, "manifest.json"), "w") as f:
+    with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str, ensure_ascii=False)
 
     # ── Save human-readable summary (A9: must flag recovery-zone metrics as NOT directly comparable) ──
@@ -807,6 +909,9 @@ def run_phase_a(
         "    - Recovery-zone mean metrics (RD_cos, RD_l2, BPD_mean, EBPD_mean)",
         "    - These are NOT directly comparable across Grid 1 conditions",
         "    - Treat as exploratory only",
+        "  Degradation CI estimator:",
+        "    - Point: max(0, baseline_acc - condition_acc)",
+        "    - Bootstrap: max(0, mean_resample(baseline_correct - condition_correct))",
         "",
         "-" * 60,
         "Grid 1: Position effect (fixed width = 4)",
@@ -884,7 +989,7 @@ def run_phase_a(
     summary_text = "\n".join(summary_lines)
     print(summary_text)
 
-    with open(os.path.join(run_dir, "phase_a_summary.txt"), "w") as f:
+    with open(os.path.join(run_dir, "phase_a_summary.txt"), "w", encoding="utf-8") as f:
         f.write(summary_text)
 
     # ── D9: Conservative-wording grep — fail run on forbidden phrases ────
@@ -957,6 +1062,40 @@ def run_phase_a(
         checks.append(("Grid intersection self-consistency (fixed_w4_pos2 == fixed_b8_w4)", True))
     else:
         checks.append(("Grid intersection self-consistency (skipped — not both present)", True))
+
+    # Stage 1 hardening (2026-04-25): hidden-state artifact self-verification.
+    # Re-load every hidden_states_*.pt and check sample_id set, tensor shape,
+    # dtype, layer count. A run is NOT valid if any tensor file is broken.
+    expected_sample_ids = [s["sample_id"] for s in samples]
+    try:
+        hs_reports = verify_hidden_state_artifacts(
+            run_dir,
+            expected_sample_ids,
+            expected_layer_count=n_layers,
+            expected_hidden_size=getattr(recipient.config, "hidden_size", None),
+            raise_on_error=False,
+        )
+        hs_summary = summarise_reports(hs_reports)
+    except (FileNotFoundError, HiddenStateVerificationError) as exc:
+        hs_summary = {"all_ok": False, "fatal": repr(exc), "artifacts": []}
+
+    checks.append((
+        f"Hidden-state artifact verification "
+        f"({hs_summary.get('n_artifacts', 0)} files, "
+        f"{'OK' if hs_summary['all_ok'] else 'FAIL'})",
+        bool(hs_summary["all_ok"]),
+    ))
+
+    # Persist the hidden-state verification report into manifest.json so
+    # downstream phases can audit Stage 1's artifact integrity without
+    # re-loading the .pt files themselves.
+    _manifest_path = os.path.join(run_dir, "manifest.json")
+    if os.path.exists(_manifest_path):
+        with open(_manifest_path, encoding="utf-8") as _mf:
+            _m = json.load(_mf)
+        _m["hidden_state_verification"] = hs_summary
+        with open(_manifest_path, "w", encoding="utf-8") as _mf:
+            json.dump(_m, _mf, indent=2, ensure_ascii=False, default=str)
 
     for label, ok in checks:
         status = "PASS" if ok else "FAIL"

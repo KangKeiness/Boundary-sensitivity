@@ -1,6 +1,10 @@
-transformers>=4.40.0
+# Stage 1 runtime is validated on Python 3.10-3.12.
+# Python 3.13+ (including 3.14) may fail to install torch wheels.
+torch>=2.3.0
+transformers>=4.40.0,<5.0.0
 datasets>=2.19.0
 scipy>=1.13.0
 pyyaml>=6.0
 accelerate>=0.30.0
 numpy>=1.26.0
+pytest>=8.2.0

@@ -51,6 +51,11 @@ class DatasetConfig:
     lang: str = "te"
     split: str = "test"
     debug_n: Optional[int] = None
+    # Stage 1 hardening (2026-04-25): pin dataset to a stable snapshot.
+    # ``revision`` controls the HuggingFace ref (commit SHA preferred).
+    # ``expected_sha256`` locks the file bytes; mismatch aborts the run.
+    revision: Optional[str] = None
+    expected_sha256: Optional[str] = None
 
 
 @dataclass
@@ -80,7 +85,22 @@ class Stage1Config:
     evaluation: EvaluationConfig
 
     def validate(self):
-        """Run validation checks on the config."""
+        """Run validation checks on the config. Fail-closed."""
+        # Stage 1 hardening: reject duplicate boundary values up front. A
+        # duplicate would silently double a condition's contribution to the
+        # sweep and corrupt downstream aggregates (BDS, bootstrap CI). There
+        # is no legitimate reason to declare the same boundary twice.
+        if len(set(self.boundary_grid)) != len(self.boundary_grid):
+            seen = set()
+            dups = []
+            for b in self.boundary_grid:
+                if b in seen and b not in dups:
+                    dups.append(b)
+                seen.add(b)
+            raise ValueError(
+                f"boundary_grid contains duplicate values: {dups}. "
+                f"Each boundary must appear exactly once. Got {self.boundary_grid}."
+            )
         for b in self.boundary_grid:
             if b >= self.t_fixed:
                 raise ValueError(f"Boundary b={b} must be less than t_fixed={self.t_fixed}")

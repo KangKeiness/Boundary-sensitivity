@@ -1,20 +1,33 @@
-"""Runtime smoke tests for Stage 1 / Phase A (runtime_repro_v5 §10).
+"""Runtime smoke tests for Stage 1 / Phase A.
 
-Four regression tests guarding the plumbing-only hardening in v5:
+These tests deliberately bypass the conftest transformers stub so they
+reflect REAL runtime readiness, not the sandbox's mocked environment.
 
-  1. ``stage1.run`` is importable as a package module (covers the bare-import
-     regression at stage1/run.py L11–L25).
+Stage 1 hardening (2026-04-25): the previous version called
+``pytest.importorskip("transformers")`` which was satisfied by the conftest
+stub — the smoke test then always tried to spawn a subprocess (which has no
+stub) and either ran it or failed misleadingly. Two harnesses, one sandbox:
+the smoke result was uncorrelated with whether the runtime was actually ready.
+
+Resolution:
+  * ``_real_transformers_available()`` checks for the on-disk package by
+    inspecting ``__is_test_stub__`` and ``__file__`` flags before falling
+    back to ``importlib.util.find_spec`` in a fresh subprocess.
+  * Smoke tests skip with an explicit reason when only the stub is present,
+    so the result is binary: real-deps-present → run smoke; real-deps-absent
+    → skip cleanly. No false greens, no false reds from stub leakage.
+
+Tests covered here:
+
+  1. ``stage1.run`` importable as a package module (regression: bare-import
+     drift in stage1/run.py).
   2. ``python -m stage1.run --help`` exits 0 from the repo root.
-  3. ``stage1.utils.config.load_config`` opens YAML as UTF-8 regardless of the
-     OS locale (covers Windows cp949 ambient).
-  4. The Phase A no-swap reuse path passes ``sample_ids=`` to
-     ``extract_parity_block``, so reuse against a v4+ manifest with a
-     ``sample_regime`` block no longer raises
-     ``"sample regime mode ...: missing in current config"``.
-
-Torch-free where feasible. Test 4 is split into a pure parity-check variant
-(runs always) and an end-to-end gated variant (requires torch). The pure
-variant still fails on pre-fix code, preserving the regression signal.
+  3. ``stage1.utils.config.load_config`` opens YAML as UTF-8 regardless of
+     the OS locale (Windows cp949 ambient).
+  4. The Phase A no-swap reuse path passes ``sample_ids=`` so reuse against
+     a v4+ manifest no longer raises on missing sample_regime.
+  5. Stub-detection regression: smoke tests must NOT pass while the stub
+     is the only ``transformers`` available.
 """
 
 from __future__ import annotations
@@ -37,21 +50,80 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
+# ─── Stub-aware availability helpers ────────────────────────────────────────
+#
+# conftest.py installs a deterministic transformers stub at session start.
+# `pytest.importorskip("transformers")` is satisfied by that stub and gives
+# us no signal about whether the REAL runtime is ready. These helpers ask the
+# precise question instead: "is the on-disk transformers package importable
+# in a clean subprocess that does NOT inherit our stub?".
+
+
+def _module_is_stub(name: str) -> bool:
+    """Return True iff ``sys.modules[name]`` is the conftest-installed stub."""
+    mod = sys.modules.get(name)
+    if mod is None:
+        return False
+    if getattr(mod, "__is_test_stub__", False):
+        return True
+    # Older stubs flagged themselves only by lacking ``__file__``.
+    return not hasattr(mod, "__file__")
+
+
+def _real_module_available_in_subprocess(name: str) -> bool:
+    """True iff ``import {name}`` succeeds in a fresh Python subprocess.
+
+    The subprocess does NOT inherit our in-process module table, so the
+    conftest stub is invisible to it. This is the only reliable way to ask
+    "is the real package installed?" from inside pytest.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {name}"],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return result.returncode == 0
+
+
+def _require_real_runtime() -> None:
+    """Skip the current test unless the real transformers + torch are available.
+
+    Two-step check, both required:
+      * In-process ``transformers`` is the conftest stub or absent → skip.
+      * A fresh subprocess can ``import transformers`` and ``import torch``
+        → otherwise skip.
+    """
+    if _module_is_stub("transformers"):
+        # Stub is masking the real package's absence; only the subprocess
+        # check is authoritative.
+        if not _real_module_available_in_subprocess("transformers"):
+            pytest.skip(
+                "real `transformers` is not installed in this environment "
+                "(only the conftest stub is loaded). Smoke tests reflect "
+                "true runtime readiness — skipping."
+            )
+    elif "transformers" not in sys.modules and \
+            importlib.util.find_spec("transformers") is None:
+        pytest.skip("real `transformers` not installed in this environment")
+
+    if not _real_module_available_in_subprocess("torch"):
+        pytest.skip("real `torch` not installed in this environment")
+
+
 # ─── §10.1 ──────────────────────────────────────────────────────────────────
 
 
 def test_stage1_run_importable():
     """``stage1.run`` must be importable under its package-qualified name.
 
-    ``stage1.run`` transitively imports torch via ``stage1.models.composer``.
-    To keep this test torch-free we probe via ``importlib.util.find_spec``
-    first (which parses the module path without executing it), then delegate
-    the full import to a subprocess so any ImportError from the bare-imports
-    regression still surfaces — without dragging torch into this pytest
-    process.
+    Stage 1 hardening (2026-04-25): availability check no longer trusts the
+    conftest stub. ``_require_real_runtime`` skips cleanly if the on-disk
+    transformers / torch packages are absent — this matches what the
+    subprocess will actually see.
     """
-    pytest.importorskip("transformers", reason="stage1.run imports transformers at module load time")
-    pytest.importorskip("torch", reason="stage1.run imports torch at module load time")
+    _require_real_runtime()
 
     spec = importlib.util.find_spec("stage1.run")
     assert spec is not None, "stage1.run not findable as a package submodule"
@@ -79,9 +151,11 @@ def test_stage1_run_m_help_exit_zero():
     ``cwd`` is the repo root (parent of ``stage1/``) — NOT ``stage1/`` — so
     any regression to bare sibling imports (``from utils.config import ...``)
     would break module resolution here and we'd see a non-zero rc.
+
+    Stage 1 hardening: real-runtime availability is checked via
+    ``_require_real_runtime``; the conftest stub does NOT mask this path.
     """
-    pytest.importorskip("transformers", reason="stage1.run imports transformers at module load time")
-    pytest.importorskip("torch", reason="stage1.run imports torch at module load time")
+    _require_real_runtime()
 
     result = subprocess.run(
         [sys.executable, "-m", "stage1.run", "--help"],
@@ -98,6 +172,92 @@ def test_stage1_run_m_help_exit_zero():
     assert "--config" in result.stdout, (
         f"--help output did not contain --config:\n{result.stdout}"
     )
+
+
+def _run_module_help_cp949(module_name: str) -> subprocess.CompletedProcess:
+    """Run `python -m <module> --help` with cp949 stdout/stderr encoding."""
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp949"
+    return subprocess.run(
+        [sys.executable, "-m", module_name, "--help"],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_phase_abc_help_cp949_exit_zero():
+    """Phase A/B/C CLI help must be locale-safe on Korean Windows cp949."""
+    _require_real_runtime()
+    modules = ["stage1.run_phase_a", "stage1.run_phase_b", "stage1.run_phase_c"]
+    for module_name in modules:
+        result = _run_module_help_cp949(module_name)
+        assert result.returncode == 0, (
+            f"`python -m {module_name} --help` failed under cp949 "
+            f"(rc={result.returncode}):\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+
+def test_phase_c_sanity_cp949_fixture_exit_zero():
+    """Minimal Phase C dry-run path must be cp949-safe."""
+    fixture_dir = _REPO_ROOT / "stage1" / "tests" / "fixtures" / "phase_b_run_fixture"
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp949"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "stage1.run_phase_c",
+            "--phase-b-run",
+            str(fixture_dir),
+            "--sanity",
+            "--bootstrap-n",
+            "10",
+            "--seed",
+            "0",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"`python -m stage1.run_phase_c --sanity` failed under cp949 "
+        f"(rc={result.returncode}):\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+
+
+# ─── §10.5: Stub-detection regression ───────────────────────────────────────
+
+
+def test_smoke_helper_detects_stub_when_real_absent():
+    """Sanity-check the stub-detection helper itself.
+
+    If ``transformers`` is the conftest stub AND a fresh subprocess cannot
+    import the real package, ``_require_real_runtime`` MUST skip — not pass.
+    This protects against re-introducing the false-confidence behavior where
+    the smoke tests trusted the in-process stub.
+
+    The test inspects the helper's behavior rather than re-running the smoke
+    tests to keep the assertion direct and avoid recursive subprocess spawn.
+    """
+    # This guard targets the specific failure mode "only stub exists, real runtime
+    # absent". If real runtime is installed, _require_real_runtime should pass.
+    if _real_module_available_in_subprocess("transformers") and \
+            _real_module_available_in_subprocess("torch"):
+        pytest.skip("real runtime is present — stub-leakage path not exercised")
+
+    # We are in the situation the regression guards against. Calling
+    # ``_require_real_runtime`` from a regular pytest function raises
+    # ``Skipped`` — capture it via pytest.raises rather than letting it
+    # bubble (otherwise we'd just skip this very test).
+    with pytest.raises(pytest.skip.Exception):
+        _require_real_runtime()
 
 
 # ─── §10.3 ──────────────────────────────────────────────────────────────────

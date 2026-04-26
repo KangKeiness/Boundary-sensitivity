@@ -25,6 +25,7 @@ Usage (Jupyter):
 from __future__ import annotations
 
 import argparse
+import builtins
 import csv
 import gc
 import hashlib
@@ -33,6 +34,7 @@ import logging
 import os
 import random
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -42,6 +44,7 @@ import transformers
 from stage1.utils.config import load_config, setup_logging
 from stage1.utils.logger import create_run_dir
 from stage1.utils.manifest_parity import extract_parity_block
+from stage1.utils.provenance import build_runtime_provenance
 from stage1.utils.anchor_gate import (
     ANCHOR_WORKFLOW_DOC,
     PHASE_A_CROSS_CHECK_TOL,
@@ -68,6 +71,46 @@ from stage1.intervention.patcher import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_CLI_ASCII_REPLACEMENTS = {
+    "—": "-",
+    "–": "-",
+    "−": "-",
+    "←": "<-",
+    "→": "->",
+    "↔": "<->",
+    "≤": "<=",
+    "≥": ">=",
+    "Δ": "delta",
+    "×": "x",
+}
+
+
+def _ascii_cli_text(text: str) -> str:
+    out = text
+    for src, dst in _CLI_ASCII_REPLACEMENTS.items():
+        out = out.replace(src, dst)
+    return out.encode("ascii", errors="replace").decode("ascii")
+
+
+def _safe_print(*args, **kwargs):
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "\n")
+    file = kwargs.pop("file", sys.stdout)
+    flush = kwargs.pop("flush", False)
+    if kwargs:
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush, **kwargs)
+    if file not in (sys.stdout, sys.stderr):
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush)
+    msg = sep.join(str(a) for a in args)
+    file.write(_ascii_cli_text(msg) + end)
+    if flush:
+        file.flush()
+
+
+# Keep artifacts unchanged; only sanitize stdout/stderr for locale-safe CLI.
+print = _safe_print
 
 # Effect-size threshold for the comparative sentence gate (spec §7, §11.10).
 EPSILON_DELTA: float = 0.02
@@ -472,6 +515,13 @@ def run_phase_b(
             phase_a = None
 
     # (13) Environment block.
+    # Stage 1 hardening (2026-04-25): merge in the canonical runtime_provenance
+    # so Phase B manifests carry the same git_sha / versions / command /
+    # dataset-revision/sha256 fields as Phase A, in addition to the Phase B
+    # specific determinism + device fields.
+    runtime_provenance = build_runtime_provenance(
+        config=config, config_path=config_path,
+    )
     env_block: Dict[str, Any] = {
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
@@ -486,6 +536,7 @@ def run_phase_b(
         "seed": seed,
         # RED LIGHT P4: record generation config for decode-budget traceability.
         "generation_config": gen_config,
+        "runtime_provenance": runtime_provenance,
     }
 
     # (14) Build summary JSON.
@@ -740,7 +791,7 @@ def run_phase_b(
             ))
     elif cross_check_passed:
         checks.append((
-            f"Cross-check PASSED: BOTH anchors within |Δ| ≤ {PHASE_A_CROSS_CHECK_TOL} "
+            f"Cross-check PASSED: BOTH anchors within abs_delta <= {PHASE_A_CROSS_CHECK_TOL} "
             f"(hard_swap_b8 from {anchor_hard_swap_source}, "
             f"no_swap from {anchor_no_swap_source})",
             True,
@@ -820,7 +871,7 @@ def main() -> None:
         "--config", type=str, required=True,
         help="Path to Phase B config YAML (required). Must match the Stage 1 / "
              "Phase A anchors' configs in models, dataset, generation, and "
-             "hidden-state pooling — see notes/anchors_workflow.md.",
+             "hidden-state pooling - see notes/anchors_workflow.md.",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -832,7 +883,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--sanity", action="store_true",
-        help="Sanity mode (development only): 5 samples × "
+        help="Sanity mode (development only): 5 samples x "
              "{no_patch, patch_recovery_full, clean_no_patch, "
              "corrupt_recovery_full}. Relaxes the anchor gate to best-effort. "
              "Never use for review or final results.",

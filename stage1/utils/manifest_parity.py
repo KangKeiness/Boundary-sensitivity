@@ -99,6 +99,11 @@ _PARITY_FIELDS: List[Tuple[str, str]] = [
     ("dataset.name", "dataset name"),
     ("dataset.lang", "dataset language"),
     ("dataset.split", "dataset split"),
+    # Stage 1 hardening (2026-04-25): dataset bytes must agree across the
+    # parity contract. ``revision`` controls what we fetched; ``sha256`` is
+    # the realised file digest. Either drift is a hard mismatch.
+    ("dataset.revision", "dataset revision (HF ref)"),
+    ("dataset.sha256", "dataset SHA-256 (file bytes)"),
     ("generation.do_sample", "generation do_sample"),
     ("generation.temperature", "generation temperature"),
     ("generation.max_new_tokens", "generation max_new_tokens"),
@@ -161,6 +166,20 @@ def extract_parity_block(
             # v4 P2: debug_n is a parity-checked field — debug subsets are not
             # comparable to full runs even when every other field agrees.
             "debug_n": getattr(config.dataset, "debug_n", None),
+            # Stage 1 hardening (2026-04-25): dataset bytes are part of the
+            # parity contract. ``revision`` is the HF ref the loader fetched
+            # from; ``sha256`` is the realised file digest stamped by the
+            # loader onto config.dataset._provenance. If load_mgsm has not
+            # been called yet (e.g. test fixture path), fall back to the
+            # configured pin so the parity block still encodes intent.
+            "revision": (
+                (getattr(config.dataset, "_provenance", None) or {}).get("revision")
+                or getattr(config.dataset, "revision", None)
+            ),
+            "sha256": (
+                (getattr(config.dataset, "_provenance", None) or {}).get("sha256")
+                or getattr(config.dataset, "expected_sha256", None)
+            ),
         },
         "generation": {
             "do_sample": config.generation.do_sample,
@@ -229,10 +248,16 @@ def check_manifest_parity(
         # sample_regime fields (mode/sample_count/sample_ordering_sha256) are
         # NOT in this list — those must be present on both sides or it's a
         # mismatch. This forces anchor manifests to be regenerated under v4.
+        # Stage 1 hardening (2026-04-25): dataset.revision / dataset.sha256
+        # are NEW fields. To avoid breaking comparisons against pre-existing
+        # anchor manifests, treat MISSING-on-source as equivalent to None.
+        # Drift between two NON-MISSING values is still a hard mismatch.
         _NULL_EQUIV_PATHS = (
             "models.recipient_revision",
             "models.donor_revision",
             "dataset.debug_n",
+            "dataset.revision",
+            "dataset.sha256",
         )
         if path in _NULL_EQUIV_PATHS:
             # Normalize: MISSING → None for comparison.

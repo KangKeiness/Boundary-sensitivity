@@ -58,6 +58,13 @@ dataset:
   lang: "zh"
   split: "test"
   debug_n: null         # set integer for sanity mode (e.g. 5)
+  # Stage 1 hardening (2026-04-25): pin dataset to a stable snapshot.
+  # `revision` is the HF ref used in the resolve URL. Keep this at a commit
+  # SHA for immutability.
+  # `expected_sha256` is the byte-level pin — mismatch aborts the run.
+  # See notes/data_changelog.md (mgsm_zh@v1.0-2022-10-03).
+  revision: "8b764d53dba2de1f684b836bb45c7ce389900fde"
+  expected_sha256: "b2fa63151022370a0de1f4211c8c284eae74b0f5a3b003b1d5982c0d4a73f661"
 
 generation:
   do_sample: false

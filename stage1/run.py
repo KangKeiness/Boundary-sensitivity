@@ -17,12 +17,17 @@ import gc
 import json
 import logging
 import os
+from typing import Optional
 
 import torch
 
 from stage1.utils.config import load_config, setup_logging
 from stage1.data.loader import load_mgsm
-from stage1.models.composer import load_models, get_condition_model
+from stage1.models.composer import (
+    compute_random_donor_seed,
+    get_condition_model,
+    load_models,
+)
 from stage1.inference.runner import run_inference
 from stage1.inference.parser import parse_answer
 from stage1.analysis.bds import compute_bds
@@ -35,45 +40,160 @@ from stage1.utils.logger import (
     save_evaluation,
     save_manifest,
 )
+from stage1.utils.hidden_state_verify import (
+    HiddenStateVerificationError,
+    summarise_reports,
+    verify_hidden_state_artifacts,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def verify_results(run_dir: str, in_memory_eval: dict, in_memory_bds: dict,
-                   samples, eval_config: dict, boundary_grid):
+                   samples, eval_config: dict, boundary_grid,
+                   hidden_state_info: Optional[dict] = None):
     """
-    Reload saved results from disk, re-run evaluate_experiment(), and assert
+    Reload saved artifacts from disk, re-run evaluate_experiment(), and assert
     key metrics match the in-memory evaluation (within 1e-6).
 
-    Catches file I/O corruption, non-deterministic evaluation bugs, and
-    serialization/deserialization errors.
-
-    Writes "self_verification": "passed" | "failed" into manifest.json.
+    Fail-closed checks include:
+      * expected condition files exist (results_*.jsonl, bds_*.json)
+      * sample_id coverage is complete with no duplicates
+      * boundary_table length/order are unchanged
+      * hidden-state artifacts pass structural verification
     """
     manifest_path = os.path.join(run_dir, "manifest.json")
 
-    # ── Reload results_*.jsonl files ──────────────────────────────────────
     reloaded_parsed: dict = {}
     for fname in os.listdir(run_dir):
         if fname.startswith("results_") and fname.endswith(".jsonl"):
             cond = fname[len("results_"):-len(".jsonl")]
             rows = []
-            with open(os.path.join(run_dir, fname)) as f:
+            with open(os.path.join(run_dir, fname), encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         rows.append(json.loads(line))
             reloaded_parsed[cond] = rows
 
-    # ── Reload bds_*.json files ───────────────────────────────────────────
     reloaded_bds: dict = {}
     for fname in os.listdir(run_dir):
         if fname.startswith("bds_") and fname.endswith(".json"):
             cond = fname[len("bds_"):-len(".json")]
-            with open(os.path.join(run_dir, fname)) as f:
+            with open(os.path.join(run_dir, fname), encoding="utf-8") as f:
                 reloaded_bds[cond] = json.load(f)
 
-    # ── Re-run evaluation on reloaded data ────────────────────────────────
+    divergences = []
+    expected_sample_ids = [s["sample_id"] for s in samples]
+    expected_sample_set = set(expected_sample_ids)
+
+    expected_conditions = {"no_swap"}
+    for b in boundary_grid:
+        expected_conditions.add(f"hard_swap_b{b}")
+        expected_conditions.add(f"random_donor_b{b}")
+    expected_bds_conditions = expected_conditions - {"no_swap"}
+
+    loaded_result_conditions = set(reloaded_parsed)
+    missing_results = sorted(expected_conditions - loaded_result_conditions)
+    unexpected_results = sorted(loaded_result_conditions - expected_conditions)
+    if missing_results:
+        divergences.append(f"missing results_*.jsonl conditions: {missing_results}")
+    if unexpected_results:
+        divergences.append(f"unexpected results_*.jsonl conditions: {unexpected_results}")
+
+    for cond in sorted(loaded_result_conditions):
+        rows = reloaded_parsed.get(cond, [])
+        if not isinstance(rows, list):
+            divergences.append(f"{cond}: parsed rows are not a list")
+            continue
+
+        row_ids = []
+        missing_id_rows = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                missing_id_rows += 1
+                continue
+            sid = row.get("sample_id")
+            if sid is None:
+                missing_id_rows += 1
+                continue
+            row_ids.append(sid)
+
+        row_set = set(row_ids)
+        missing_samples = sorted(expected_sample_set - row_set)
+        unexpected_samples = sorted(row_set - expected_sample_set)
+
+        if len(rows) != len(expected_sample_ids):
+            divergences.append(
+                f"{cond}: row_count={len(rows)} expected={len(expected_sample_ids)}"
+            )
+        if missing_id_rows:
+            divergences.append(f"{cond}: rows missing sample_id={missing_id_rows}")
+        if len(row_ids) != len(row_set):
+            divergences.append(f"{cond}: duplicate sample_id rows in results")
+        if missing_samples:
+            divergences.append(
+                f"{cond}: missing sample_ids ({len(missing_samples)}): {missing_samples[:5]}"
+            )
+        if unexpected_samples:
+            divergences.append(
+                f"{cond}: unexpected sample_ids ({len(unexpected_samples)}): {unexpected_samples[:5]}"
+            )
+
+    loaded_bds_conditions = set(reloaded_bds)
+    missing_bds = sorted(expected_bds_conditions - loaded_bds_conditions)
+    unexpected_bds = sorted(loaded_bds_conditions - expected_bds_conditions)
+    if missing_bds:
+        divergences.append(f"missing bds_*.json conditions: {missing_bds}")
+    if unexpected_bds:
+        divergences.append(f"unexpected bds_*.json conditions: {unexpected_bds}")
+
+    for cond in sorted(loaded_bds_conditions & expected_bds_conditions):
+        bds_obj = reloaded_bds.get(cond, {})
+        per_sample = bds_obj.get("per_sample", [])
+        if not isinstance(per_sample, list):
+            divergences.append(f"{cond}: bds.per_sample is not a list")
+            continue
+
+        bds_ids = []
+        missing_id_rows = 0
+        for row in per_sample:
+            if not isinstance(row, dict):
+                missing_id_rows += 1
+                continue
+            sid = row.get("sample_id")
+            if sid is None:
+                missing_id_rows += 1
+                continue
+            bds_ids.append(sid)
+
+        bds_set = set(bds_ids)
+        missing_samples = sorted(expected_sample_set - bds_set)
+        unexpected_samples = sorted(bds_set - expected_sample_set)
+
+        if len(per_sample) != len(expected_sample_ids):
+            divergences.append(
+                f"{cond}: bds.per_sample count={len(per_sample)} expected={len(expected_sample_ids)}"
+            )
+        if missing_id_rows:
+            divergences.append(f"{cond}: bds rows missing sample_id={missing_id_rows}")
+        if len(bds_ids) != len(bds_set):
+            divergences.append(f"{cond}: duplicate sample_id rows in bds.per_sample")
+        if missing_samples:
+            divergences.append(
+                f"{cond}: bds missing sample_ids ({len(missing_samples)}): {missing_samples[:5]}"
+            )
+        if unexpected_samples:
+            divergences.append(
+                f"{cond}: bds unexpected sample_ids ({len(unexpected_samples)}): {unexpected_samples[:5]}"
+            )
+
+        n_samples = bds_obj.get("n_samples")
+        if n_samples != len(expected_sample_ids):
+            divergences.append(
+                f"{cond}: bds.n_samples={n_samples} expected={len(expected_sample_ids)}"
+            )
+
     fresh_eval = evaluate_experiment(
         samples=samples,
         condition_results=reloaded_parsed,
@@ -81,9 +201,6 @@ def verify_results(run_dir: str, in_memory_eval: dict, in_memory_bds: dict,
         boundary_grid=boundary_grid,
         config=eval_config,
     )
-
-    # ── Compare key metrics ───────────────────────────────────────────────
-    divergences = []
 
     def _check(key, a, b):
         if a is None and b is None:
@@ -94,63 +211,128 @@ def verify_results(run_dir: str, in_memory_eval: dict, in_memory_bds: dict,
         if abs(float(a) - float(b)) > 1e-6:
             divergences.append(f"{key}: in_memory={a:.8f}  reloaded={b:.8f}")
 
-    _check("baseline_accuracy",
-           in_memory_eval.get("baseline_accuracy"),
-           fresh_eval.get("baseline_accuracy"))
+    _check(
+        "baseline_accuracy",
+        in_memory_eval.get("baseline_accuracy"),
+        fresh_eval.get("baseline_accuracy"),
+    )
 
-    for row_mem, row_fresh in zip(
-        in_memory_eval.get("boundary_table", []),
-        fresh_eval.get("boundary_table", []),
-    ):
+    mem_boundary_table = in_memory_eval.get("boundary_table", [])
+    fresh_boundary_table = fresh_eval.get("boundary_table", [])
+    if len(mem_boundary_table) != len(fresh_boundary_table):
+        divergences.append(
+            "boundary_table length mismatch: "
+            f"in_memory={len(mem_boundary_table)} reloaded={len(fresh_boundary_table)}"
+        )
+
+    mem_boundaries = [row.get("boundary") for row in mem_boundary_table]
+    fresh_boundaries = [row.get("boundary") for row in fresh_boundary_table]
+    if mem_boundaries != fresh_boundaries:
+        divergences.append(
+            "boundary_table ordering mismatch: "
+            f"in_memory={mem_boundaries} reloaded={fresh_boundaries}"
+        )
+
+    for row_mem, row_fresh in zip(mem_boundary_table, fresh_boundary_table):
         b = row_mem.get("boundary")
-        _check(f"boundary_{b}_accuracy",
-               row_mem.get("accuracy"), row_fresh.get("accuracy"))
-        _check(f"boundary_{b}_bds_total",
-               row_mem.get("bds_total"), row_fresh.get("bds_total"))
+        _check(
+            f"boundary_{b}_accuracy",
+            row_mem.get("accuracy"),
+            row_fresh.get("accuracy"),
+        )
+        _check(
+            f"boundary_{b}_bds_total",
+            row_mem.get("bds_total"),
+            row_fresh.get("bds_total"),
+        )
 
     mem_c = in_memory_eval.get("criteria", {})
     fresh_c = fresh_eval.get("criteria", {})
-    for key in ("criterion_1_delta_ci_excludes_zero",
-                "criterion_2_bootstrap_positive",
-                "criterion_3_ordering_consistent",
-                "passed"):
+    for key in (
+        "criterion_1_delta_ci_excludes_zero",
+        "criterion_2_bootstrap_positive",
+        "criterion_3_ordering_consistent",
+        "passed",
+    ):
         mv, fv = mem_c.get(key), fresh_c.get(key)
         if mv != fv:
             divergences.append(f"criteria.{key}: in_memory={mv!r}  reloaded={fv!r}")
 
-    # ── Verify random_donor BDS disk-write consistency ────────────────────
-    for fname in os.listdir(run_dir):
-        if fname.startswith("bds_random_donor_") and fname.endswith(".json"):
-            cond = fname[len("bds_"):-len(".json")]
-            mem_bds = in_memory_bds.get(cond)
-            rel_bds = reloaded_bds.get(cond)
-            if mem_bds is None or rel_bds is None:
-                divergences.append(f"{cond}: missing in_memory or reloaded BDS")
-                continue
-            _check(f"{cond}.aggregate.mean_bds_total",
-                   mem_bds.get("aggregate", {}).get("mean_bds_total"),
-                   rel_bds.get("aggregate", {}).get("mean_bds_total"))
+    for cond in sorted(expected_bds_conditions):
+        if not cond.startswith("random_donor_b"):
+            continue
+        mem_bds = in_memory_bds.get(cond)
+        rel_bds = reloaded_bds.get(cond)
+        if mem_bds is None or rel_bds is None:
+            divergences.append(f"{cond}: missing in_memory or reloaded BDS")
+            continue
+        _check(
+            f"{cond}.aggregate.mean_bds_total",
+            mem_bds.get("aggregate", {}).get("mean_bds_total"),
+            rel_bds.get("aggregate", {}).get("mean_bds_total"),
+        )
 
-    # ── Report and update manifest ────────────────────────────────────────
-    verification_status = "failed" if divergences else "passed"
+    hs_expected_layers: Optional[int] = None
+    hs_expected_hidden: Optional[int] = None
+    if hidden_state_info is not None:
+        hs_expected_layers = hidden_state_info.get("layer_count")
+        if (
+            isinstance(hidden_state_info.get("shape"), (list, tuple))
+            and len(hidden_state_info["shape"]) >= 2
+        ):
+            hs_expected_hidden = hidden_state_info["shape"][-1]
+
+    hs_verification: dict
+    hs_failure_msg: Optional[str] = None
+    try:
+        reports = verify_hidden_state_artifacts(
+            run_dir,
+            expected_sample_ids,
+            expected_layer_count=hs_expected_layers,
+            expected_hidden_size=hs_expected_hidden,
+            raise_on_error=False,
+        )
+        hs_verification = summarise_reports(reports)
+        if not hs_verification["all_ok"]:
+            hs_failure_msg = "; ".join(
+                f"{a['condition']}: {a['errors']}"
+                for a in hs_verification["artifacts"] if not a["ok"]
+            )
+    except (FileNotFoundError, HiddenStateVerificationError) as exc:
+        hs_verification = {"all_ok": False, "fatal": repr(exc)}
+        hs_failure_msg = repr(exc)
+
+    verification_status = "failed" if (divergences or hs_failure_msg) else "passed"
 
     if manifest_path and os.path.exists(manifest_path):
-        with open(manifest_path) as f:
+        with open(manifest_path, encoding="utf-8") as f:
             manifest = json.load(f)
         manifest["self_verification"] = verification_status
         if divergences:
             manifest["self_verification_divergences"] = divergences
-        with open(manifest_path, "w") as f:
+        manifest["hidden_state_verification"] = hs_verification
+        if hs_failure_msg:
+            manifest["hidden_state_verification_failure"] = hs_failure_msg
+        with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     if divergences:
-        msg = "SELF-VERIFICATION FAILED — diverging metrics:\n" + "\n".join(f"  {d}" for d in divergences)
+        msg = "SELF-VERIFICATION FAILED - diverging metrics:\n" + "\n".join(
+            f"  {d}" for d in divergences
+        )
+        logger.error(msg)
+        raise AssertionError(msg)
+
+    if hs_failure_msg:
+        msg = (
+            "SELF-VERIFICATION FAILED - hidden-state artifacts:\n  "
+            + hs_failure_msg
+        )
         logger.error(msg)
         raise AssertionError(msg)
 
     print("SELF-VERIFICATION PASSED")
     logger.info("self_verification: passed")
-
 
 def build_conditions(config):
     """Build the list of (condition_name, b, t) tuples to run."""
@@ -176,6 +358,14 @@ def run_condition(condition_name, b, t, recipient, donor, tokenizer, samples, co
     else:
         cond_key = condition_name
 
+    random_donor_seed = config.random_donor.seed
+    if cond_key == "random_donor":
+        if b is None or t is None:
+            raise ValueError("random_donor condition requires both b and t")
+        random_donor_seed = compute_random_donor_seed(
+            config.random_donor.seed, b, t
+        )
+
     # get_condition_model now returns (model, metadata)
     model, cond_metadata = get_condition_model(
         recipient=recipient,
@@ -185,8 +375,11 @@ def run_condition(condition_name, b, t, recipient, donor, tokenizer, samples, co
         t=t,
         b_ref=config.reference.b_ref,
         t_ref=config.reference.t_ref,
-        random_donor_seed=config.random_donor.seed,
+        random_donor_seed=random_donor_seed,
     )
+    if cond_key == "random_donor":
+        cond_metadata["seed_base"] = config.random_donor.seed
+        cond_metadata["seed_formula"] = "seed_base*1000 + b*100 + t"
 
     gen_config = {
         "do_sample":      config.generation.do_sample,
@@ -269,6 +462,7 @@ def main():
     all_inference: dict = {}
     all_parsed: dict    = {}
     random_donor_source_starts: dict = {}
+    random_donor_condition_seeds: dict = {}
 
     for cond_name, b, t in conditions:
         inf_results, parsed_results, cond_meta = run_condition(
@@ -286,8 +480,10 @@ def main():
 
         if cond_name.startswith("random_donor_b") and "source_start" in cond_meta:
             random_donor_source_starts[cond_name] = cond_meta["source_start"]
+            if "seed" in cond_meta:
+                random_donor_condition_seeds[cond_name] = cond_meta["seed"]
             print(f"  Random donor source_start={cond_meta['source_start']} "
-                  f"(cond={cond_name}, seed={config.random_donor.seed})")
+                  f"(cond={cond_name}, seed={cond_meta.get('seed', config.random_donor.seed)})")
 
         save_results(run_dir, cond_name, parsed_results)
         save_hidden_states(run_dir, cond_name, inf_results)
@@ -349,6 +545,8 @@ def main():
         sample_ids=[s["sample_id"] for s in samples],
         hidden_state_info=hidden_state_info,
         random_donor_source_start=random_donor_source_starts,
+        random_donor_condition_seed=random_donor_condition_seeds,
+        config_path=args.config,
     )
     print(f"\nAll results saved to: {run_dir}")
 
@@ -360,6 +558,7 @@ def main():
         samples=samples,
         eval_config=eval_config,
         boundary_grid=config.boundary_grid,
+        hidden_state_info=hidden_state_info,
     )
 
     # ── Print summary ─────────────────────────────────────────────────────
