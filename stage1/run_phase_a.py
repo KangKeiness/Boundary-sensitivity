@@ -1071,6 +1071,7 @@ def run_phase_a(
         hs_reports = verify_hidden_state_artifacts(
             run_dir,
             expected_sample_ids,
+            expected_condition_names=[c[0] for c in conditions],
             expected_layer_count=n_layers,
             expected_hidden_size=getattr(recipient.config, "hidden_size", None),
             raise_on_error=False,
@@ -1102,6 +1103,24 @@ def run_phase_a(
         print(f"  [{status}] {label}")
 
     all_pass = all(ok for _, ok in checks)
+
+    failure_reason = None if all_pass else (
+        "sanity_check_failed: "
+        + " | ".join(label for label, ok in checks if not ok)
+    )
+
+    for artifact_name in ("manifest.json", "phase_a_summary.json"):
+        _artifact_path = os.path.join(run_dir, artifact_name)
+        if os.path.exists(_artifact_path):
+            with open(_artifact_path, encoding="utf-8") as _af:
+                _artifact = json.load(_af)
+            _artifact["run_status"] = "passed" if all_pass else "failed"
+            _artifact["failure_reason"] = failure_reason
+            if artifact_name == "phase_a_summary.json":
+                _artifact["hidden_state_verification"] = hs_summary
+            with open(_artifact_path, "w", encoding="utf-8") as _af:
+                json.dump(_artifact, _af, indent=2, ensure_ascii=False, default=str)
+
     print(f"\nPhase A {'PASSED' if all_pass else 'FAILED'} all sanity checks.")
     print(f"Outputs saved to: {run_dir}")
 

@@ -62,6 +62,24 @@ def _canonical_parity() -> Dict[str, Any]:
     }
 
 
+def _hidden_ok(*conditions: str) -> Dict[str, Any]:
+    return {
+        "all_ok": True,
+        "artifacts": [
+            {
+                "condition": c,
+                "n_samples": 250,
+                "layer_count": 28,
+                "hidden_size": 1536,
+                "dtype": "torch.float32",
+                "ok": True,
+                "errors": [],
+            }
+            for c in conditions
+        ],
+    }
+
+
 def _write_phase_a_run(
     base: str,
     run_id: str,
@@ -97,7 +115,11 @@ def _write_phase_a_run(
         else:
             json.dump(summary, f)
     if not omit_manifest:
-        manifest = {"phase": "A"}
+        manifest = {
+            "phase": "A",
+            "run_status": "passed",
+            "hidden_state_verification": _hidden_ok("no_swap"),
+        }
         if parity is not None:
             manifest["parity"] = parity
         with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as f:
@@ -125,11 +147,19 @@ def _write_stage1_run(
     with open(os.path.join(run_dir, "evaluation.json"), "w", encoding="utf-8") as f:
         json.dump(eval_dict, f)
     if not omit_manifest:
-        manifest = {"phase": "1"}
+        manifest = {
+            "phase": "Stage1",
+            "run_status": "passed",
+            "self_verification": "passed",
+            "conditions": ["no_swap", "hard_swap_b8"],
+            "hidden_state_verification": _hidden_ok("no_swap", "hard_swap_b8"),
+        }
         if parity is not None:
             manifest["parity"] = parity
         with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f)
+    with open(os.path.join(run_dir, "bds_hard_swap_b8.json"), "w", encoding="utf-8") as f:
+        json.dump({"b": 8, "t": 20}, f)
     return run_dir
 
 
@@ -204,7 +234,16 @@ def test_full_run_missing_no_swap_anchor_hard_fails(empty_anchor_dirs):
             {"accuracies": {"hard_swap_b8": {"accuracy": 0.32}}}, f,
         )
     with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump({"parity": parity}, f)
+        json.dump({
+            "phase": "Stage1",
+            "run_status": "passed",
+            "self_verification": "passed",
+            "conditions": ["no_swap", "hard_swap_b8"],
+            "hidden_state_verification": _hidden_ok("no_swap", "hard_swap_b8"),
+            "parity": parity,
+        }, f)
+    with open(os.path.join(run_dir, "bds_hard_swap_b8.json"), "w", encoding="utf-8") as f:
+        json.dump({"b": 8, "t": 20}, f)
 
     result = evaluate_phase_b_anchor_gate(
         no_patch_acc=0.32, clean_baseline_acc=0.80,
@@ -288,6 +327,130 @@ def test_full_run_stage1_parity_incompatible_anchor_rejected(empty_anchor_dirs):
     assert "hard_swap_b8" in result.missing_anchors
     assert "no_swap" in result.missing_anchors
     assert result.stage1_evaluation_path is None
+
+
+def test_stage1_failed_self_verification_rejected(empty_anchor_dirs):
+    """Stage1 anchors must fail closed when self_verification failed."""
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    run_dir = _write_stage1_run(
+        s1_dir, "run_20260419_000000",
+        parity=parity, hard_swap_acc=0.32, no_swap_acc=0.80,
+    )
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest["self_verification"] = "failed"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    assert result.passed is None
+    assert "hard_swap_b8" in result.missing_anchors
+    assert any("self_verification" in r for r in result.anchor_rejections)
+
+
+def test_stage1_partial_hidden_verification_rejected(empty_anchor_dirs):
+    """Stage1 anchors require hidden verification entries for no_swap and hard_swap_b8."""
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    run_dir = _write_stage1_run(
+        s1_dir, "run_20260419_000000",
+        parity=parity, hard_swap_acc=0.32, no_swap_acc=0.80,
+    )
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest["hidden_state_verification"] = _hidden_ok("no_swap")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    assert result.passed is None
+    assert "hard_swap_b8" in result.missing_anchors
+    assert any("hard_swap_b8" in r for r in result.anchor_rejections)
+
+
+def test_stage1_missing_validity_metadata_rejected_by_default(empty_anchor_dirs):
+    """Legacy Stage1 manifests without validity metadata are ambiguous and rejected."""
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    run_dir = _write_stage1_run(
+        s1_dir, "run_20260419_000000",
+        parity=parity, hard_swap_acc=0.32, no_swap_acc=0.80,
+    )
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    del manifest["self_verification"]
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    assert result.passed is None
+    assert any("missing required validity field" in r for r in result.anchor_rejections)
+
+
+def test_phase_a_failed_no_swap_source_rejected(empty_anchor_dirs):
+    """Phase A no_swap anchors must carry passed run_status."""
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    run_dir = _write_phase_a_run(
+        os.path.dirname(pa_dir), "run_20260420_000000",
+        parity=parity, no_swap_acc=0.80,
+    )
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest["run_status"] = "failed"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    _write_stage1_run(
+        s1_dir, "run_20260419_000000",
+        parity=parity, hard_swap_acc=0.32, no_swap_acc=None,
+    )
+
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    assert result.passed is None
+    assert "no_swap" in result.missing_anchors
+    assert any("manifest.run_status='failed'" in r for r in result.anchor_rejections)
+
+
+def test_phase_a_hard_swap_b8_row_not_used_as_treatment_anchor(empty_anchor_dirs):
+    """Even a valid Phase A hard_swap_b8-like row cannot supply treatment anchor."""
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    _write_phase_a_run(
+        os.path.dirname(pa_dir), "run_20260420_000000",
+        parity=parity, no_swap_acc=0.80, hard_swap_acc=0.32,
+    )
+
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    assert result.passed is None
+    assert "hard_swap_b8" in result.missing_anchors
+    assert result.phase_a_hard_swap_b8_accuracy == 0.32
+    assert result.anchor_hard_swap_source is None
+    assert any("canonical Stage1" in r for r in result.anchor_rejections)
 
 
 def test_full_run_manifest_missing_anchor_rejected(empty_anchor_dirs):
@@ -424,12 +587,181 @@ def test_summary_dict_contains_required_fields(both_anchors_compatible):
         "phase_a_summary_path", "phase_a_outputs_dir",
         "phase_a_hard_swap_b8_accuracy", "phase_a_no_swap_accuracy",
         "stage1_evaluation_path", "stage1_hard_swap_b8_accuracy",
-        "stage1_no_swap_accuracy",
+        "stage1_no_swap_accuracy", "stage1_criteria_passed",
         "anchor_hard_swap_b8_accuracy", "anchor_hard_swap_source",
         "anchor_no_swap_accuracy", "anchor_no_swap_source",
         "tolerance", "passed", "missing_anchors", "failed_anchors", "note",
     ):
         assert key in d, f"missing key in summary dict: {key}"
+
+
+# ─── PRIORITY 1.J — stage1_criteria_passed surfaces in diagnostics ───────────
+# Pre-main-run hardening: anchor diagnostic should expose Stage 1's own
+# 2-of-3 criteria.passed flag without making it a hard gate.
+
+
+def _write_stage1_run_with_criteria(
+    base: str, run_id: str, *,
+    parity: Dict[str, Any],
+    criteria_passed: Optional[bool],
+    hard_swap_acc: float = 0.32,
+    no_swap_acc: float = 0.80,
+) -> str:
+    """Helper that writes a Stage 1 run dir whose evaluation.json carries an
+    explicit ``criteria.passed`` flag (or omits the criteria block entirely
+    when ``criteria_passed is None``)."""
+    run_dir = os.path.join(base, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    eval_dict: Dict[str, Any] = {
+        "baseline_accuracy": no_swap_acc,
+        "accuracies": {
+            "hard_swap_b8": {"accuracy": hard_swap_acc},
+            "no_swap": {"accuracy": no_swap_acc},
+        },
+    }
+    if criteria_passed is not None:
+        eval_dict["criteria"] = {
+            "criterion_1_delta_ci_excludes_zero": True,
+            "criterion_2_bootstrap_positive": True,
+            "criterion_3_ordering_consistent": True,
+            "passed": criteria_passed,
+        }
+    with open(os.path.join(run_dir, "evaluation.json"), "w", encoding="utf-8") as f:
+        json.dump(eval_dict, f)
+    with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "phase": "Stage1",
+            "run_status": "passed",
+            "self_verification": "passed",
+            "conditions": ["no_swap", "hard_swap_b8"],
+            "hidden_state_verification": _hidden_ok("no_swap", "hard_swap_b8"),
+            "parity": parity,
+        }, f)
+    with open(os.path.join(run_dir, "bds_hard_swap_b8.json"), "w", encoding="utf-8") as f:
+        json.dump({"b": 8, "t": 20}, f)
+    return run_dir
+
+
+def test_stage1_criteria_passed_propagates_true(empty_anchor_dirs):
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    _write_stage1_run_with_criteria(
+        s1_dir, "run_20260419_000000", parity=parity, criteria_passed=True,
+    )
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    assert result.stage1_criteria_passed is True
+    assert result.to_summary_dict()["stage1_criteria_passed"] is True
+
+
+def test_stage1_criteria_passed_propagates_false_advisory_only(empty_anchor_dirs):
+    """criteria.passed=False MUST NOT cause the anchor gate to fail (advisory).
+
+    Parity + tolerance remain the gate. We assert that an anchor with
+    criteria_passed=False still passes the cross-check when accuracies are
+    within tolerance, but that the diagnostic on a separate failure surfaces
+    the advisory.
+    """
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    _write_stage1_run_with_criteria(
+        s1_dir, "run_20260419_000000", parity=parity, criteria_passed=False,
+    )
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    # No Phase A no_swap → that anchor is missing → result.passed is None.
+    # The criteria.passed=False alone must NOT be the cause of failure.
+    assert result.stage1_criteria_passed is False
+    # Hard_swap_b8 came from Stage 1 and was within tolerance (anchor=0.32,
+    # measurement=0.32). The fact that Stage 1 criteria did not pass does
+    # NOT add itself to failed_anchors.
+    assert not any("criteria" in f for f in result.failed_anchors)
+
+
+def test_stage1_criteria_missing_yields_none(empty_anchor_dirs):
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    _write_stage1_run_with_criteria(
+        s1_dir, "run_20260419_000000", parity=parity, criteria_passed=None,
+    )
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.80,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    assert result.stage1_criteria_passed is None
+    assert result.to_summary_dict()["stage1_criteria_passed"] is None
+
+
+def test_stage1_criteria_passed_advisory_appears_in_diagnostic(empty_anchor_dirs):
+    """When the gate fails for OTHER reasons, the advisory line is appended
+    if the Stage 1 run's criteria.passed is False."""
+    from stage1.utils.anchor_gate import render_anchor_gate_diagnostic
+    pa_dir, s1_dir = empty_anchor_dirs
+    parity = _canonical_parity()
+    # Stage 1 has hard_swap_b8 with criteria_passed=False; force a tolerance
+    # failure on no_swap so the gate fails for an unrelated reason.
+    _write_stage1_run_with_criteria(
+        s1_dir, "run_20260419_000000", parity=parity, criteria_passed=False,
+        hard_swap_acc=0.32, no_swap_acc=0.80,
+    )
+    # Pull no_swap measurement far outside tolerance to trigger failed_anchors.
+    result = evaluate_phase_b_anchor_gate(
+        no_patch_acc=0.32, clean_baseline_acc=0.50,
+        sanity=False, current_parity=parity,
+        phase_a_dir=pa_dir, stage1_dir=s1_dir,
+    )
+    diag = render_anchor_gate_diagnostic(result, phase_a_dir=pa_dir, stage1_dir=s1_dir)
+    assert "criteria.passed=False" in diag
+    assert result.passed is False
+
+
+# ─── PRIORITY 1.K — gate-variable shadowing regression ──────────────────────
+# The Phase B run path used to overwrite the outer-scope ``gate``
+# (AnchorGateResult) with a boolean inside the comparative-sentence block.
+# That broke ``render_anchor_gate_diagnostic`` on the sanity-failure path
+# (AttributeError on a bool). These tests pin the contract: the diagnostic
+# helper only accepts an AnchorGateResult and the production source no
+# longer rebinds ``gate``.
+
+
+def test_render_anchor_gate_diagnostic_rejects_bool_input():
+    """Defensive: a bool fed to the diagnostic helper must NOT silently work.
+
+    This locks in the failure mode that existed before the gate-shadowing
+    fix — passing a bool there used to crash with AttributeError.
+    """
+    from stage1.utils.anchor_gate import render_anchor_gate_diagnostic
+    with pytest.raises(AttributeError):
+        render_anchor_gate_diagnostic(True)  # type: ignore[arg-type]
+
+
+def test_run_phase_b_does_not_rebind_anchor_gate_variable():
+    """Source-level guard: ``gate = ...`` only assigns the AnchorGateResult.
+
+    Anything else assigning to ``gate =`` in stage1/run_phase_b.py is a
+    regression of the variable-shadowing bug.
+    """
+    import re
+    src_path = os.path.join(_REPO_ROOT, "stage1", "run_phase_b.py")
+    with open(src_path, encoding="utf-8") as f:
+        src = f.read()
+    # Find every "<spaces>gate = ..." line.
+    assignments = re.findall(r"(?m)^\s*gate\s*=\s*(.+)$", src)
+    assert assignments, "expected at least one ``gate = ...`` assignment"
+    for rhs in assignments:
+        rhs = rhs.strip()
+        assert rhs.startswith("evaluate_phase_b_anchor_gate"), (
+            f"unexpected ``gate = {rhs}`` — only the AnchorGateResult "
+            "assignment is allowed; the comparative-sentence boolean must "
+            "use a different name (e.g. ``comparative_gate``)."
+        )
 
 
 # ─── PRIORITY 1.I — production loaders exposed and usable ────────────────────
@@ -443,5 +775,5 @@ def test_load_latest_phase_a_summary_returns_none_when_empty(empty_anchor_dirs):
 
 def test_load_latest_stage1_returns_none_when_empty(empty_anchor_dirs):
     _, s1_dir = empty_anchor_dirs
-    hs, ns, p = load_latest_stage1_hard_swap_b8(s1_dir, _canonical_parity())
-    assert hs is None and ns is None and p is None
+    hs, ns, p, crit = load_latest_stage1_hard_swap_b8(s1_dir, _canonical_parity())
+    assert hs is None and ns is None and p is None and crit is None

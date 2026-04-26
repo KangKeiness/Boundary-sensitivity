@@ -134,3 +134,41 @@ def test_summary_schema(good_run_dir):
     for art in summary["artifacts"]:
         assert {"condition", "n_samples", "layer_count", "hidden_size",
                 "dtype", "ok", "errors"}.issubset(art.keys())
+
+
+def test_expected_condition_missing_raises(tmp_path):
+    _write_hs(tmp_path, "no_swap", ["s0"])
+    with pytest.raises(
+        HiddenStateVerificationError,
+        match="missing expected condition artifacts",
+    ):
+        verify_hidden_state_artifacts(
+            str(tmp_path), ["s0"],
+            expected_condition_names=["no_swap", "hard_swap_b8"],
+        )
+
+
+def test_unexpected_condition_raises_when_expected_set_supplied(tmp_path):
+    _write_hs(tmp_path, "no_swap", ["s0"])
+    _write_hs(tmp_path, "extra_condition", ["s0"])
+    with pytest.raises(
+        HiddenStateVerificationError,
+        match="unexpected condition artifacts",
+    ):
+        verify_hidden_state_artifacts(
+            str(tmp_path), ["s0"],
+            expected_condition_names=["no_swap"],
+        )
+
+
+def test_complete_expected_condition_set_passes(tmp_path):
+    _write_hs(tmp_path, "no_swap", ["s0", "s1"], layers=4, hidden=8)
+    _write_hs(tmp_path, "hard_swap_b8", ["s0", "s1"], layers=4, hidden=8)
+    reports = verify_hidden_state_artifacts(
+        str(tmp_path), ["s0", "s1"],
+        expected_condition_names=["no_swap", "hard_swap_b8"],
+        expected_layer_count=4,
+        expected_hidden_size=8,
+    )
+    assert {r["condition"] for r in reports} == {"no_swap", "hard_swap_b8"}
+    assert all(r["ok"] for r in reports)

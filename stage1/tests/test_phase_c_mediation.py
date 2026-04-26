@@ -1,4 +1,4 @@
-"""Unit tests for Phase C mediation-style decomposition.
+"""Unit tests for Phase C restoration-style decomposition.
 
 Covers:
 - JSONL loader (happy path, duplicate-id error, missing-field error)
@@ -58,8 +58,8 @@ def test_phase_c_txt_header_byte_equals_spec_literal():
     """Spec §11.10 mandates the exact em-dash header string."""
     from stage1.run_phase_c import PHASE_C_TXT_HEADER
     expected = (
-        "Phase C \u2014 mediation-style decomposition of prompt-side "
-        "restoration intervention (not a formal NIE/NDE decomposition)"
+        "Phase C \u2014 restoration-style decomposition of prompt-side "
+        "restoration intervention"
     )
     assert PHASE_C_TXT_HEADER == expected, (
         f"PHASE_C_TXT_HEADER drift vs spec §11.10:\n"
@@ -325,12 +325,26 @@ def test_phase_c_cli_sanity_end_to_end_against_fixture():
             txt_body = f.read()
         assert MANDATED_CAVEAT in txt_body
         assert PHASE_C_TXT_HEADER in txt_body
+        assert check_artifacts_for_forbidden(
+            [txt_path, json_path, csv_path],
+            phrases=FORBIDDEN_PHRASES_PHASE_C,
+        ) == []
+        combined_artifacts = (
+            txt_body
+            + "\n"
+            + json.dumps(summary, ensure_ascii=False)
+            + "\n"
+            + open(csv_path, encoding="utf-8").read()
+        )
+        assert "restoration_effect" in combined_artifacts
+        assert "residual_effect" in combined_artifacts
+        assert "restoration_proportion" in combined_artifacts
 
         # Spec §11.10: PHASE_C_TXT_HEADER must byte-equal the mandated literal
         # (em-dash, not ASCII hyphen). Asserted against the spec literal.
         SPEC_HEADER_LITERAL = (
-            "Phase C \u2014 mediation-style decomposition of prompt-side "
-            "restoration intervention (not a formal NIE/NDE decomposition)"
+            "Phase C \u2014 restoration-style decomposition of prompt-side "
+            "restoration intervention"
         )
         assert PHASE_C_TXT_HEADER == SPEC_HEADER_LITERAL, (
             f"PHASE_C_TXT_HEADER drift vs spec §11.10:\n"

@@ -8,6 +8,7 @@ changed) collapses the foundation.
 
 Public API:
     verify_hidden_state_artifacts(run_dir, expected_sample_ids, *,
+                                  expected_condition_names,
                                   expected_layer_count, expected_hidden_size)
 
 Returns a structured report (List[Dict]) describing every artifact checked.
@@ -46,6 +47,8 @@ def verify_hidden_state_artifacts(
     run_dir: str,
     expected_sample_ids: Iterable[str],
     *,
+    expected_condition_names: Optional[Iterable[str]] = None,
+    allow_unexpected_conditions: bool = False,
     expected_layer_count: Optional[int] = None,
     expected_hidden_size: Optional[int] = None,
     raise_on_error: bool = True,
@@ -53,6 +56,8 @@ def verify_hidden_state_artifacts(
     """Verify every ``hidden_states_*.pt`` in ``run_dir``.
 
     Checks (per file):
+      0. If ``expected_condition_names`` is supplied, the set of
+         ``hidden_states_*.pt`` files exactly covers that condition set.
       1. File loads with ``torch.load(map_location="cpu")``.
       2. Top-level object is a dict keyed by sample_id (strings).
       3. Sample-ID set is exactly equal to ``expected_sample_ids``.
@@ -68,6 +73,12 @@ def verify_hidden_state_artifacts(
         run_dir: Path to the run directory.
         expected_sample_ids: Iterable of strings — the canonical sample-ID
             set that should be present in every artifact. Order is irrelevant.
+        expected_condition_names: Optional iterable of condition names that
+            must have matching ``hidden_states_{condition}.pt`` artifacts.
+            When supplied, missing expected artifacts fail verification.
+        allow_unexpected_conditions: When False (default), condition files not
+            listed in ``expected_condition_names`` also fail verification.
+            Set True only for explicit debugging / exploratory analysis.
         expected_layer_count: If set, every artifact's per-sample tensor must
             have first-dim == this value.
         expected_hidden_size: If set, every artifact's per-sample tensor must
@@ -104,6 +115,44 @@ def verify_hidden_state_artifacts(
 
     reports: List[Dict[str, Any]] = []
     aggregate_failures: List[str] = []
+
+    observed_conditions = {
+        os.path.basename(path)[len("hidden_states_"):-len(".pt")]
+        for path in files
+    }
+    if expected_condition_names is not None:
+        expected_conditions = {str(c) for c in expected_condition_names}
+        missing_conditions = sorted(expected_conditions - observed_conditions)
+        unexpected_conditions = sorted(observed_conditions - expected_conditions)
+
+        coverage_errors: List[str] = []
+        if missing_conditions:
+            coverage_errors.append(
+                "missing expected condition artifacts: "
+                + ", ".join(missing_conditions[:10])
+                + ("..." if len(missing_conditions) > 10 else "")
+            )
+        if unexpected_conditions and not allow_unexpected_conditions:
+            coverage_errors.append(
+                "unexpected condition artifacts: "
+                + ", ".join(unexpected_conditions[:10])
+                + ("..." if len(unexpected_conditions) > 10 else "")
+            )
+
+        if coverage_errors:
+            reports.append({
+                "condition": "__coverage__",
+                "path": run_dir,
+                "n_samples": None,
+                "layer_count": None,
+                "hidden_size": None,
+                "dtype": None,
+                "ok": False,
+                "errors": coverage_errors,
+            })
+            aggregate_failures.extend(
+                f"condition coverage: {err}" for err in coverage_errors
+            )
 
     for path in files:
         condition = os.path.basename(path)[len("hidden_states_"):-len(".pt")]

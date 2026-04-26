@@ -11,10 +11,8 @@ Two tuples are exposed:
   "restoration proportion") as forbidden so that Phase B artifacts cannot
   accidentally adopt Phase C's decomposition terms.
 - ``FORBIDDEN_PHRASES_PHASE_C`` — the Phase C list. Phase C's core vocabulary is
-  allowed (it is the phase's reporting language), but formal causal-mediation
-  terminology ("natural direct effect", "natural indirect effect", "NIE", "NDE",
-  "causal mediation") is forbidden because the prompt-side restoration
-  intervention does not license NIE/NDE claims.
+  allowed because it is the phase's reporting language, while stronger formal
+  causal-decomposition terminology is blocked.
 
 Backward compatibility: ``FORBIDDEN_PHRASES`` remains a module attribute and is
 bound to ``FORBIDDEN_PHRASES_PHASE_B`` so that all existing Phase B call sites
@@ -24,6 +22,7 @@ and tests that iterate this tuple continue to pass bytewise.
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Optional, Sequence, Tuple
 
 # Canonical Phase B list. Order matters only for deterministic test iteration.
@@ -47,20 +46,30 @@ FORBIDDEN_PHRASES_PHASE_C: Tuple[str, ...] = (
     "identifies the true cause",
     "fully explains",
     "demonstrates causation",
+    "mediation-style",
+    "mediation analysis",
+    "formal mediation",
+    "causal mediation",
     "natural direct effect",
     "natural indirect effect",
-    "causal mediation",
-    # Note: the "NIE/NDE" / "NDE/NIE" literal tokens in spec §8 are
-    # intentionally NOT included — they collide with the verbatim mandated
-    # caveat ("...not a formal NIE/NDE decomposition.") that every Phase C
-    # summary must contain. The spelled-out "natural direct effect" /
-    # "natural indirect effect" phrases above remain forbidden, so formal
-    # mediation prose is still blocked.
+    "NIE",
+    "NDE",
 )
 
 # Backward-compat alias for existing Phase B call sites (including
 # ``stage1/run_phase_b.py`` and ``stage1/tests/test_phase_b_patcher.py``).
 FORBIDDEN_PHRASES: Tuple[str, ...] = FORBIDDEN_PHRASES_PHASE_B
+
+
+_ACRONYM_PHRASES = {"nie", "nde"}
+
+
+def _contains_forbidden_phrase(content_lower: str, phrase: str) -> bool:
+    phrase_lower = phrase.lower()
+    if phrase_lower in _ACRONYM_PHRASES:
+        pattern = rf"(?<![a-z0-9_]){re.escape(phrase_lower)}(?![a-z0-9_])"
+        return re.search(pattern, content_lower) is not None
+    return phrase_lower in content_lower
 
 
 def check_artifacts_for_forbidden(
@@ -94,6 +103,6 @@ def check_artifacts_for_forbidden(
         with open(path, encoding="utf-8") as f:
             content = f.read().lower()
         for phrase in active_phrases:
-            if phrase.lower() in content:
+            if _contains_forbidden_phrase(content, phrase):
                 violations.append(f"{path}: found forbidden phrase '{phrase}'")
     return violations

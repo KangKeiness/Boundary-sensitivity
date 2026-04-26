@@ -1,4 +1,4 @@
-"""Phase C — Mediation-style decomposition (analysis-only).
+"""Phase C — restoration-style decomposition (analysis-only).
 
 This entrypoint consumes a completed Phase B run directory's per-condition
 JSONLs and emits a three-artifact decomposition under
@@ -9,8 +9,9 @@ JSONLs and emits a three-artifact decomposition under
 - ``phase_c_summary.txt``
 
 IMPORTANT METHODOLOGICAL CONSTRAINT:
-    Mediation analysis here decomposes accuracy deltas under prompt-side
-    restoration intervention only. It is not a formal NIE/NDE decomposition.
+    This analysis decomposes accuracy deltas under prompt-side restoration
+    intervention only. It is a descriptive restoration decomposition and does
+    not identify a complete causal mechanism.
 
 See ``notes/specs/phase_c_mediation.md`` for the authoritative spec.
 """
@@ -87,16 +88,17 @@ def _safe_print(*args, **kwargs):
 print = _safe_print
 
 
-# Verbatim mandated caveat per spec §scope note. Byte-exact; do not reword.
+# Verbatim mandated caveat per spec scope note. Byte-exact; do not reword.
 MANDATED_CAVEAT: str = (
-    "Mediation analysis here decomposes accuracy deltas under prompt-side "
-    "restoration intervention only. It is not a formal NIE/NDE decomposition."
+    "This analysis decomposes accuracy deltas under prompt-side restoration "
+    "intervention only. It is a descriptive restoration decomposition and "
+    "does not identify a complete causal mechanism."
 )
 
-# Header line per spec §11.10.
+# Header line per spec.
 PHASE_C_TXT_HEADER: str = (
-    "Phase C \u2014 mediation-style decomposition of prompt-side restoration "
-    "intervention (not a formal NIE/NDE decomposition)"
+    "Phase C \u2014 restoration-style decomposition of prompt-side restoration "
+    "intervention"
 )
 
 
@@ -231,12 +233,12 @@ def _assert_phase_b_passed(
 
 
 def _create_run_dir(run_name: Optional[str]) -> str:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     leaf = f"run_{ts}" if not run_name else f"run_{ts}_{run_name}"
     base = _phase_c_outputs_dir()
     os.makedirs(base, exist_ok=True)
     run_dir = os.path.join(base, leaf)
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=False)
     return str(pathlib.Path(run_dir).resolve())
 
 
@@ -275,8 +277,8 @@ _CSV_COLUMNS: Tuple[str, ...] = (
     "restoration_proportion_ci_hi",
     "restoration_proportion_ci_reason",
     "total_effect",
-    # RED LIGHT P5: alias_NIE/NDE/TE/MP columns REMOVED to eliminate formal
-    # mediation terminology risk. Use only conservative terms:
+    # RED LIGHT P5: formal decomposition aliases removed. Use only conservative
+    # restoration terms:
     # restoration_effect, residual_effect, restoration_proportion.
     "n_aligned",
     "is_best_condition",
@@ -284,7 +286,7 @@ _CSV_COLUMNS: Tuple[str, ...] = (
 )
 
 _METHODOLOGY_TAG: str = (
-    "prompt-side restoration intervention (not a formal NIE/NDE decomposition)"
+    "prompt-side restoration intervention; descriptive restoration decomposition"
 )
 
 
@@ -317,12 +319,12 @@ def _write_decomposition_csv(
         row: Dict[str, str] = {k: "" for k in _CSV_COLUMNS}
         row["condition"] = r["condition"]
         row["accuracy"] = _fmt(r.get("accuracy"))
-        # Per-condition restoration_effect (NIE).
+        # Per-condition restoration_effect.
         row["restoration_effect"] = _fmt(r.get("restoration_effect"))
         row["restoration_effect_ci_lo"] = _fmt(r.get("restoration_effect_ci_lo"))
         row["restoration_effect_ci_hi"] = _fmt(r.get("restoration_effect_ci_hi"))
-        # Per-condition residual_effect (NDE) + restoration_proportion (MP).
-        # mediation.compute_decomposition_table populates these for every
+        # Per-condition residual_effect + restoration_proportion.
+        # analysis.compute_decomposition_table populates these for every
         # patched condition (spec §11.2 updated — reviewer Phase C 4a).
         row["residual_effect"] = _fmt(r.get("residual_effect"))
         row["residual_effect_ci_lo"] = _fmt(r.get("residual_effect_ci_lo"))
@@ -461,7 +463,7 @@ def _build_summary_json(
     summary: Dict[str, Any] = {
         "phase": "C",
         "description": (
-            "Mediation-style decomposition of Phase B accuracy deltas under "
+            "Restoration-style decomposition of Phase B accuracy deltas under "
             "prompt-side restoration intervention."
         ),
         "caveat": MANDATED_CAVEAT,
@@ -605,7 +607,7 @@ def run_phase_c(
     run_name: Optional[str] = None,
     allow_failed_upstream: bool = False,
 ) -> str:
-    """Run Phase C mediation-style decomposition analysis.
+    """Run Phase C restoration-style decomposition analysis.
 
     Returns:
         Absolute path to the Phase C run directory.
@@ -630,7 +632,7 @@ def run_phase_c(
 
     run_dir = _create_run_dir(run_name)
 
-    print("Phase C \u2014 mediation-style decomposition (prompt-side only)")
+    print("Phase C \u2014 restoration-style decomposition (prompt-side only)")
     print(f"  Phase B run : {phase_b_run_dir}")
     print(f"  Upstream    : run_status={upstream_status!r}"
           + (" [OVERRIDE: --allow-failed-upstream]"
@@ -797,7 +799,7 @@ def _cross_check_accuracies(summary: Dict[str, Any], phase_b_run_dir: str) -> No
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase C: mediation-style decomposition of Phase B deltas.",
+        description="Phase C: restoration-style decomposition of Phase B deltas.",
     )
     parser.add_argument(
         "--phase-b-run", type=str, default=None,
