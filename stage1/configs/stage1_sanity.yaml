@@ -23,6 +23,9 @@ dataset:
   lang: "zh"
   split: "test"
   debug_n: 20
+  # Stage 1 hardening: pin dataset to a stable snapshot (see notes/data_changelog.md).
+  revision: "8b764d53dba2de1f684b836bb45c7ce389900fde"
+  expected_sha256: "b2fa63151022370a0de1f4211c8c284eae74b0f5a3b003b1d5982c0d4a73f661"
 
 generation:
   do_sample: false

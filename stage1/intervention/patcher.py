@@ -18,6 +18,7 @@ Usage (Jupyter):
 from __future__ import annotations
 
 import logging
+import inspect
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -83,13 +84,77 @@ def get_all_patch_configs() -> List[PatchConfig]:
 def _get_model_components(model: AutoModelForCausalLM):
     """Return (embed_tokens, layers, norm, rotary_emb) from a Qwen2-family model."""
     inner = model.model
+    layers = inner.layers
     rotary = getattr(inner, "rotary_emb", None)
+    if rotary is None and layers:
+        # transformers 4.40.x stores rotary_emb under each attention module;
+        # 4.45+/4.57.x exposes it as model.model.rotary_emb.
+        rotary = getattr(getattr(layers[0], "self_attn", None), "rotary_emb", None)
     if rotary is None:
         raise AttributeError(
-            "Expected model.model.rotary_emb on a Qwen2-family model; "
+            "Expected Qwen2 rotary_emb on model.model or layer.self_attn; "
             "transformers version may have moved the rotary embedding."
         )
-    return inner.embed_tokens, inner.layers, inner.norm, rotary
+    return inner.embed_tokens, layers, inner.norm, rotary
+
+
+def _past_length(past_key_values) -> int:
+    """Best-effort cache length helper across transformers cache variants."""
+    if past_key_values is None:
+        return 0
+    for method in ("get_seq_length", "get_usable_length"):
+        fn = getattr(past_key_values, method, None)
+        if fn is None:
+            continue
+        try:
+            return int(fn())
+        except TypeError:
+            try:
+                return int(fn(0))
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return 0
+
+
+def _legacy_4d_causal_mask(
+    model: AutoModelForCausalLM,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values,
+) -> torch.Tensor:
+    """Build a 4D causal mask when transformers.masking_utils is absent."""
+    batch, seq, _ = inputs_embeds.shape
+    past_len = _past_length(past_key_values)
+    try:
+        from transformers.modeling_attn_mask_utils import (
+            _prepare_4d_causal_attention_mask,
+        )
+
+        return _prepare_4d_causal_attention_mask(
+            attention_mask,
+            (batch, seq),
+            inputs_embeds,
+            past_len,
+            sliding_window=getattr(model.config, "sliding_window", None),
+        )
+    except Exception:
+        min_dtype = torch.finfo(inputs_embeds.dtype).min
+        target_len = past_len + seq
+        q_positions = (
+            torch.arange(seq, device=inputs_embeds.device).view(seq, 1) + past_len
+        )
+        k_positions = torch.arange(target_len, device=inputs_embeds.device).view(
+            1, target_len
+        )
+        blocked = k_positions > q_positions
+        mask = torch.zeros(
+            (batch, 1, seq, target_len),
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
+        return mask.masked_fill(blocked.view(1, 1, seq, target_len), min_dtype)
 
 
 def _build_causal_mask(
@@ -100,11 +165,12 @@ def _build_causal_mask(
     past_key_values,
     position_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Build a 4D causal attention mask, accommodating both known transformers paths.
+    """Build a 4D causal attention mask across transformers API variants.
 
-    Spec §12 R1: try ``model.model._update_causal_mask`` first (older path, 4.38–4.44),
-    fall back to ``transformers.masking_utils.create_causal_mask`` (4.45+/5.x).
-    If neither is available, fail-fast with a clear message.
+    First try ``model.model._update_causal_mask`` (older path). If unavailable,
+    use ``transformers.masking_utils.create_causal_mask`` and adapt keyword names
+    via signature introspection (for example ``input_embeds`` vs
+    ``inputs_embeds`` across releases).
     """
     inner = model.model
     if hasattr(inner, "_update_causal_mask"):
@@ -113,20 +179,73 @@ def _build_causal_mask(
         )
     try:
         from transformers.masking_utils import create_causal_mask  # type: ignore
-    except ImportError as exc:
+    except ImportError:
+        return _legacy_4d_causal_mask(
+            model=model,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+
+    params = inspect.signature(create_causal_mask).parameters
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    def accepts(name: str) -> bool:
+        return has_var_kw or name in params
+
+    kwargs = {}
+    if accepts("config"):
+        kwargs["config"] = model.config
+    if accepts("attention_mask"):
+        kwargs["attention_mask"] = attention_mask
+    if accepts("cache_position"):
+        kwargs["cache_position"] = cache_position
+    if accepts("position_ids"):
+        kwargs["position_ids"] = position_ids
+
+    # transformers API drift: input_embeds (newer) vs inputs_embeds (older).
+    if accepts("input_embeds"):
+        kwargs["input_embeds"] = inputs_embeds
+    elif accepts("inputs_embeds"):
+        kwargs["inputs_embeds"] = inputs_embeds
+    else:
         raise RuntimeError(
-            "Neither model.model._update_causal_mask nor "
-            "transformers.masking_utils.create_causal_mask is available. "
-            "Unsupported transformers version."
-        ) from exc
-    return create_causal_mask(
-        config=model.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        cache_position=cache_position,
-        past_key_values=past_key_values,
-        position_ids=position_ids,
-    )
+            "create_causal_mask signature is missing input_embeds/inputs_embeds"
+        )
+
+    # Keep backward compatibility if cache arg name changes.
+    if accepts("past_key_values"):
+        kwargs["past_key_values"] = past_key_values
+    elif accepts("past_key_value"):
+        kwargs["past_key_value"] = past_key_values
+    elif accepts("cache"):
+        kwargs["cache"] = past_key_values
+    else:
+        raise RuntimeError(
+            "create_causal_mask signature is missing past_key_values-compatible parameter"
+        )
+
+    try:
+        return create_causal_mask(**kwargs)
+    except TypeError as exc:
+        try:
+            return create_causal_mask(
+                model.config,
+                inputs_embeds,
+                attention_mask,
+                cache_position,
+                past_key_values,
+                position_ids,
+            )
+        except TypeError:
+            raise RuntimeError(
+                "Could not call transformers.masking_utils.create_causal_mask "
+                f"with signature {inspect.signature(create_causal_mask)}"
+            ) from exc
+
+
+def _layer_forward_params(layer) -> Dict[str, inspect.Parameter]:
+    return dict(inspect.signature(layer.forward).parameters)
 
 
 def _build_prompt_inputs(
@@ -143,7 +262,7 @@ def _build_prompt_inputs(
         - ``position_embeddings``: tuple ``(cos, sin)`` from ``rotary_emb``
         - ``cache_position``: [S]
     """
-    embed_tokens, _, _, rotary_emb = _get_model_components(model)
+    embed_tokens, layers, _, rotary_emb = _get_model_components(model)
 
     batch, seq = input_ids.shape
     device = input_ids.device
@@ -163,9 +282,15 @@ def _build_prompt_inputs(
         position_ids=position_ids,
     )
 
-    # rotary_emb signature stabilised on (hidden_states, position_ids) → (cos, sin).
-    cos, sin = rotary_emb(hidden, position_ids)
-    position_embeddings = (cos, sin)
+    position_embeddings = None
+    if layers and "position_embeddings" in _layer_forward_params(layers[0]):
+        # transformers 4.45+/4.57.x computes RoPE once at model level and
+        # passes (cos, sin) into each decoder layer. transformers 4.40.x
+        # computes RoPE inside each attention module, so this remains None.
+        try:
+            position_embeddings = rotary_emb(hidden, position_ids)
+        except TypeError:
+            position_embeddings = rotary_emb(hidden, seq_len=seq)
 
     return {
         "hidden": hidden,
@@ -302,15 +427,28 @@ def forward_with_patches(
                 )
             hidden = patch_in.to(device=hidden.device, dtype=hidden.dtype)
 
-        layer_output = layer(
-            hidden,
-            attention_mask=attention_mask_4d,
-            position_ids=position_ids,
-            past_key_values=cache,
-            use_cache=(cache is not None),
-            position_embeddings=position_embeddings,
-            cache_position=cache_position,
-        )
+        params = _layer_forward_params(layer)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        layer_kwargs = {
+            "attention_mask": attention_mask_4d,
+            "position_ids": position_ids,
+            "use_cache": (cache is not None),
+        }
+        if cache is not None:
+            if "past_key_values" in params:
+                layer_kwargs["past_key_values"] = cache
+            elif "past_key_value" in params:
+                layer_kwargs["past_key_value"] = cache
+            elif has_var_kw:
+                layer_kwargs["past_key_values"] = cache
+        if position_embeddings is not None and (
+            "position_embeddings" in params or has_var_kw
+        ):
+            layer_kwargs["position_embeddings"] = position_embeddings
+        if "cache_position" in params or has_var_kw:
+            layer_kwargs["cache_position"] = cache_position
+
+        layer_output = layer(hidden, **layer_kwargs)
         # Qwen2 layer returns hidden tensor directly in 4.45+/5.x; older versions
         # return a tuple. Handle both.
         if isinstance(layer_output, tuple):
@@ -409,13 +547,17 @@ def _greedy_continue_with_cache(
         position_ids = cache_position.unsqueeze(0)
 
         with torch.no_grad():
-            outputs = model(
-                input_ids=current,
-                past_key_values=cache,
-                use_cache=True,
-                cache_position=cache_position,
-                position_ids=position_ids,
-            )
+            forward_params = inspect.signature(model.forward).parameters
+            model_kwargs = {
+                "input_ids": current,
+                "past_key_values": cache,
+                "use_cache": True,
+            }
+            if "cache_position" in forward_params:
+                model_kwargs["cache_position"] = cache_position
+            if "position_ids" in forward_params:
+                model_kwargs["position_ids"] = position_ids
+            outputs = model(**model_kwargs)
         logits = outputs.logits[:, -1, :]
         next_id = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1]
         generated.append(next_id)

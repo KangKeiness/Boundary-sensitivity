@@ -18,6 +18,7 @@ See ``notes/specs/phase_c_mediation.md`` for the authoritative spec.
 from __future__ import annotations
 
 import argparse
+import builtins
 import csv
 import glob
 import hashlib
@@ -44,6 +45,46 @@ from stage1.utils.wording import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_CLI_ASCII_REPLACEMENTS = {
+    "—": "-",
+    "–": "-",
+    "−": "-",
+    "←": "<-",
+    "→": "->",
+    "↔": "<->",
+    "≤": "<=",
+    "≥": ">=",
+    "Δ": "delta",
+    "×": "x",
+}
+
+
+def _ascii_cli_text(text: str) -> str:
+    out = text
+    for src, dst in _CLI_ASCII_REPLACEMENTS.items():
+        out = out.replace(src, dst)
+    return out.encode("ascii", errors="replace").decode("ascii")
+
+
+def _safe_print(*args, **kwargs):
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "\n")
+    file = kwargs.pop("file", sys.stdout)
+    flush = kwargs.pop("flush", False)
+    if kwargs:
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush, **kwargs)
+    if file not in (sys.stdout, sys.stderr):
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush)
+    msg = sep.join(str(a) for a in args)
+    file.write(_ascii_cli_text(msg) + end)
+    if flush:
+        file.flush()
+
+
+# Keep UTF-8 artifacts intact; sanitize only stdout/stderr for locale-safe CLI.
+print = _safe_print
 
 
 # Verbatim mandated caveat per spec §scope note. Byte-exact; do not reword.
