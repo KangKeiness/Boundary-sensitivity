@@ -16,7 +16,8 @@ Anchor source precedence:
        Phase A's confound grid does not contain hard_swap_b8 by construction).
 
 Both candidate run directories are filtered by ``manifest_parity`` against
-the current Phase B parity block before being accepted.
+the current Phase B parity block and by upstream validity metadata before
+being accepted.
 """
 
 from __future__ import annotations
@@ -36,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 # Cross-phase accuracy tolerance (2/250 samples).
 PHASE_A_CROSS_CHECK_TOL: float = 0.008
+_VALID_UPSTREAM_STATUS: str = "passed"
+_STAGE1_PHASE_NAME: str = "Stage1"
+_PHASE_A_PHASE_NAMES = {"A", "PhaseA", "phase_a", "Phase A"}
 
 # Operator-facing workflow doc; failures point here so users have a concrete
 # next step rather than guessing at parity rules.
@@ -68,11 +72,18 @@ def _read_manifest(manifest_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _record_rejection(rejections: Optional[List[str]], message: str) -> None:
+    logger.warning(message)
+    if rejections is not None:
+        rejections.append(message)
+
+
 def _parity_compatible(
     manifest_path: str,
     current_parity: Optional[Dict[str, Any]],
     *,
     run_label: str,
+    rejections: Optional[List[str]] = None,
 ) -> bool:
     """Return True iff the manifest at ``manifest_path`` is parity-compatible.
 
@@ -85,9 +96,10 @@ def _parity_compatible(
         return True
     manifest = _read_manifest(manifest_path)
     if manifest is None:
-        logger.warning(
-            "%s rejected — no readable manifest.json (P2 parity requires manifest).",
-            run_label,
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: no readable manifest.json "
+            "(parity requires manifest).",
         )
         return False
     mismatches = check_manifest_parity(
@@ -96,17 +108,278 @@ def _parity_compatible(
         target_desc="current Phase B config",
     )
     if mismatches:
-        logger.warning(
-            "%s rejected — manifest parity mismatch: %s",
-            run_label, "; ".join(mismatches),
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: manifest parity mismatch: "
+            + "; ".join(mismatches),
         )
         return False
     return True
 
 
+def _load_parity_compatible_manifest(
+    manifest_path: str,
+    current_parity: Optional[Dict[str, Any]],
+    *,
+    run_label: str,
+    rejections: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Load a manifest and return it only when manifest parity passes."""
+    manifest = _read_manifest(manifest_path)
+    if manifest is None:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: no readable manifest.json "
+            "(parity requires manifest).",
+        )
+        return None
+    if not _parity_compatible(
+        manifest_path,
+        current_parity,
+        run_label=run_label,
+        rejections=rejections,
+    ):
+        return None
+    return manifest
+
+
+def _require_passed_status(
+    obj: Dict[str, Any],
+    key: str,
+    *,
+    run_label: str,
+    field_label: str,
+    allow_missing: bool,
+    rejections: Optional[List[str]],
+) -> bool:
+    """Require ``obj[key] == 'passed'``; optionally tolerate missing only."""
+    if key not in obj:
+        if allow_missing:
+            _record_rejection(
+                rejections,
+                f"{run_label}: missing {field_label}; accepted only because "
+                "allow_unverified_upstream=True.",
+            )
+            return True
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: missing required validity field "
+            f"{field_label}.",
+        )
+        return False
+    status = obj.get(key)
+    if status != _VALID_UPSTREAM_STATUS:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: {field_label}={status!r} "
+            f"(expected {_VALID_UPSTREAM_STATUS!r}).",
+        )
+        return False
+    return True
+
+
+def _hidden_verification_valid(
+    manifest: Dict[str, Any],
+    *,
+    run_label: str,
+    required_conditions: Tuple[str, ...],
+    allow_missing: bool,
+    rejections: Optional[List[str]],
+) -> bool:
+    hsv = manifest.get("hidden_state_verification")
+    if not isinstance(hsv, dict):
+        if allow_missing:
+            _record_rejection(
+                rejections,
+                f"{run_label}: missing hidden_state_verification; accepted only "
+                "because allow_unverified_upstream=True.",
+            )
+            return True
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: missing required hidden_state_verification.",
+        )
+        return False
+    if hsv.get("all_ok") is not True:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: hidden_state_verification.all_ok="
+            f"{hsv.get('all_ok')!r}.",
+        )
+        return False
+
+    artifacts = hsv.get("artifacts")
+    if isinstance(artifacts, list):
+        ok_conditions = {
+            str(a.get("condition"))
+            for a in artifacts
+            if isinstance(a, dict) and a.get("ok") is True
+        }
+        missing = sorted(set(required_conditions) - ok_conditions)
+        if missing:
+            _record_rejection(
+                rejections,
+                f"{run_label} rejected: hidden_state_verification lacks passed "
+                f"entries for required condition(s): {missing}.",
+            )
+            return False
+    elif not allow_missing:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: hidden_state_verification.artifacts missing "
+            "or malformed.",
+        )
+        return False
+
+    return True
+
+
+def _phase_a_upstream_valid(
+    summary: Dict[str, Any],
+    manifest: Dict[str, Any],
+    *,
+    run_label: str,
+    allow_unverified_upstream: bool,
+    rejections: Optional[List[str]],
+) -> bool:
+    phase = manifest.get("phase")
+    if phase not in _PHASE_A_PHASE_NAMES:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: manifest phase={phase!r}; expected Phase A.",
+        )
+        return False
+
+    ok = _require_passed_status(
+        manifest,
+        "run_status",
+        run_label=run_label,
+        field_label="manifest.run_status",
+        allow_missing=allow_unverified_upstream,
+        rejections=rejections,
+    )
+    summary_status = summary.get("run_status")
+    if summary_status is not None and summary_status != _VALID_UPSTREAM_STATUS:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: phase_a_summary.run_status={summary_status!r} "
+            f"(expected {_VALID_UPSTREAM_STATUS!r}).",
+        )
+        ok = False
+    ok = _hidden_verification_valid(
+        manifest,
+        run_label=run_label,
+        required_conditions=("no_swap",),
+        allow_missing=allow_unverified_upstream,
+        rejections=rejections,
+    ) and ok
+    return ok
+
+
+def _stage1_upstream_valid(
+    run_dir: str,
+    eval_dict: Dict[str, Any],
+    manifest: Dict[str, Any],
+    *,
+    run_label: str,
+    allow_unverified_upstream: bool,
+    rejections: Optional[List[str]],
+) -> bool:
+    phase = manifest.get("phase")
+    if phase != _STAGE1_PHASE_NAME:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: manifest phase={phase!r}; expected "
+            f"{_STAGE1_PHASE_NAME!r} canonical Stage1 source.",
+        )
+        return False
+
+    ok = _require_passed_status(
+        manifest,
+        "self_verification",
+        run_label=run_label,
+        field_label="manifest.self_verification",
+        allow_missing=allow_unverified_upstream,
+        rejections=rejections,
+    )
+    ok = _require_passed_status(
+        manifest,
+        "run_status",
+        run_label=run_label,
+        field_label="manifest.run_status",
+        allow_missing=allow_unverified_upstream,
+        rejections=rejections,
+    ) and ok
+
+    eval_status = eval_dict.get("run_status") or eval_dict.get("evaluation_status")
+    if eval_status is not None and eval_status != _VALID_UPSTREAM_STATUS:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: evaluation status={eval_status!r} "
+            f"(expected {_VALID_UPSTREAM_STATUS!r}).",
+        )
+        ok = False
+
+    conditions = manifest.get("conditions")
+    if not isinstance(conditions, list):
+        if allow_unverified_upstream:
+            _record_rejection(
+                rejections,
+                f"{run_label}: missing manifest.conditions; accepted only "
+                "because allow_unverified_upstream=True.",
+            )
+        else:
+            _record_rejection(
+                rejections,
+                f"{run_label} rejected: missing manifest.conditions needed to "
+                "prove hard_swap_b8 is canonical.",
+            )
+            ok = False
+    elif "hard_swap_b8" not in conditions or "no_swap" not in conditions:
+        _record_rejection(
+            rejections,
+            f"{run_label} rejected: manifest.conditions must include both "
+            "hard_swap_b8 and no_swap.",
+        )
+        ok = False
+
+    bds_path = os.path.join(run_dir, "bds_hard_swap_b8.json")
+    if os.path.exists(bds_path):
+        try:
+            with open(bds_path, encoding="utf-8") as f:
+                bds = json.load(f)
+        except Exception as exc:
+            _record_rejection(
+                rejections,
+                f"{run_label} rejected: unreadable bds_hard_swap_b8.json "
+                f"({exc!r}).",
+            )
+            ok = False
+        else:
+            if bds.get("b") != 8 or bds.get("t") != 20:
+                _record_rejection(
+                    rejections,
+                    f"{run_label} rejected: hard_swap_b8 metadata has "
+                    f"b={bds.get('b')!r}, t={bds.get('t')!r}; expected b=8, t=20.",
+                )
+                ok = False
+
+    ok = _hidden_verification_valid(
+        manifest,
+        run_label=run_label,
+        required_conditions=("no_swap", "hard_swap_b8"),
+        allow_missing=allow_unverified_upstream,
+        rejections=rejections,
+    ) and ok
+    return ok
+
+
 def load_latest_phase_a_summary(
     phase_a_dir: str,
     current_parity: Optional[Dict[str, Any]] = None,
+    *,
+    allow_unverified_upstream: bool = False,
+    rejections: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Return (summary_dict, resolved_path) for the newest parity-compatible
     Phase A run, or (None, None) if no candidate matches.
@@ -120,9 +393,19 @@ def load_latest_phase_a_summary(
         except Exception:
             continue
         manifest_path = os.path.join(os.path.dirname(path), "manifest.json")
-        if not _parity_compatible(
+        manifest = _load_parity_compatible_manifest(
             manifest_path, current_parity,
             run_label=f"Phase A run {path}",
+            rejections=rejections,
+        )
+        if manifest is None:
+            continue
+        if not _phase_a_upstream_valid(
+            summary,
+            manifest,
+            run_label=f"Phase A run {path}",
+            allow_unverified_upstream=allow_unverified_upstream,
+            rejections=rejections,
         ):
             continue
         return summary, path
@@ -153,9 +436,19 @@ def phase_a_condition_accuracy(
 def load_latest_stage1_hard_swap_b8(
     stage1_dir: str,
     current_parity: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Return (hard_swap_b8_accuracy, no_swap_accuracy, evaluation_path) for the
-    newest parity-compatible Stage 1 run, or (None, None, None) on no match.
+    *,
+    allow_unverified_upstream: bool = False,
+    rejections: Optional[List[str]] = None,
+) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[bool]]:
+    """Return (hard_swap_b8_accuracy, no_swap_accuracy, evaluation_path,
+    criteria_passed) for the newest parity-compatible Stage 1 run, or
+    (None, None, None, None) on no match.
+
+    ``criteria_passed`` mirrors ``evaluation.criteria.passed`` — Stage 1's
+    operational 2-of-3 criteria stability indicator. Surfaced for diagnostics
+    only; the anchor gate does NOT hard-fail on ``criteria_passed=False``
+    because parity + tolerance are the actual reproducibility contract for
+    cross-phase anchor reuse.
     """
     pattern = os.path.join(stage1_dir, "run_*", "evaluation.json")
     candidates = sorted(glob.glob(pattern), reverse=True)
@@ -165,10 +458,22 @@ def load_latest_stage1_hard_swap_b8(
                 eval_dict = json.load(f)
         except Exception:
             continue
+        run_dir = os.path.dirname(path)
         manifest_path = os.path.join(os.path.dirname(path), "manifest.json")
-        if not _parity_compatible(
+        manifest = _load_parity_compatible_manifest(
             manifest_path, current_parity,
             run_label=f"Stage 1 run {path}",
+            rejections=rejections,
+        )
+        if manifest is None:
+            continue
+        if not _stage1_upstream_valid(
+            run_dir,
+            eval_dict,
+            manifest,
+            run_label=f"Stage 1 run {path}",
+            allow_unverified_upstream=allow_unverified_upstream,
+            rejections=rejections,
         ):
             continue
         accs = eval_dict.get("accuracies") or {}
@@ -188,9 +493,13 @@ def load_latest_stage1_hard_swap_b8(
                 else None
             )
         )
+        criteria = eval_dict.get("criteria") or {}
+        criteria_passed: Optional[bool] = (
+            bool(criteria["passed"]) if "passed" in criteria else None
+        )
         if hs_acc is not None:
-            return hs_acc, ns_acc, path
-    return None, None, None
+            return hs_acc, ns_acc, path, criteria_passed
+    return None, None, None, None
 
 
 @dataclass
@@ -219,7 +528,15 @@ class AnchorGateResult:
     stage1_evaluation_path: Optional[str] = None
     stage1_hard_swap_b8_accuracy: Optional[float] = None
     stage1_no_swap_accuracy: Optional[float] = None
+    # Advisory only: Stage 1 sweep's 2-of-3 criteria.passed flag from the run
+    # that supplied the hard_swap_b8 anchor. Surfaced in summary diagnostics
+    # so an operator can see whether the anchor came from a sweep that itself
+    # met the operational stability criteria. NOT used as a hard gate —
+    # parity + cross-check tolerance remain the actual reproducibility
+    # contract.
+    stage1_criteria_passed: Optional[bool] = None
     tolerance: float = PHASE_A_CROSS_CHECK_TOL
+    anchor_rejections: List[str] = field(default_factory=list)
 
     def to_summary_dict(
         self,
@@ -237,6 +554,7 @@ class AnchorGateResult:
             "stage1_evaluation_path": self.stage1_evaluation_path,
             "stage1_hard_swap_b8_accuracy": self.stage1_hard_swap_b8_accuracy,
             "stage1_no_swap_accuracy": self.stage1_no_swap_accuracy,
+            "stage1_criteria_passed": self.stage1_criteria_passed,
             "anchor_hard_swap_b8_accuracy": self.anchor_hard_swap_b8_accuracy,
             "anchor_hard_swap_source": self.anchor_hard_swap_source,
             "anchor_no_swap_accuracy": self.anchor_no_swap_accuracy,
@@ -245,13 +563,19 @@ class AnchorGateResult:
             "passed": self.passed,
             "missing_anchors": list(self.missing_anchors),
             "failed_anchors": list(self.failed_anchors),
+            "anchor_rejections": list(self.anchor_rejections),
             "note": (
                 "Treatment parity (no_patch ≈ hard_swap_b8) is cross-checked "
-                "against the newest Stage 1 sweep run since Phase A's confound "
-                "grid does not contain hard_swap_b8 at (b=8, t=20). Anchor "
-                "runs are filtered by manifest parity (model IDs, dataset, "
-                "generation config including max_new_tokens). See "
-                f"{ANCHOR_WORKFLOW_DOC} for the parity-compatible recipe."
+                "against the newest valid canonical Stage1 sweep run. Phase A "
+                "is allowed as a no_swap source only; it is never allowed to "
+                "supply the hard_swap_b8 treatment anchor. Anchor runs are "
+                "filtered by manifest parity (model IDs, dataset, generation "
+                "config including max_new_tokens), sample regime parity, and "
+                "passed upstream verification metadata. "
+                "stage1_criteria_passed is advisory only — it reports the "
+                "Stage 1 sweep's own 2-of-3 criteria.passed flag and is NOT "
+                "a Phase B gate; parity + cross-check tolerance are the gate. "
+                f"See {ANCHOR_WORKFLOW_DOC} for the parity-compatible recipe."
             ),
         }
 
@@ -265,6 +589,7 @@ def evaluate_phase_b_anchor_gate(
     tolerance: float = PHASE_A_CROSS_CHECK_TOL,
     phase_a_dir: Optional[str] = None,
     stage1_dir: Optional[str] = None,
+    allow_unverified_upstream: bool = False,
 ) -> AnchorGateResult:
     """Look up parity-compatible anchors and apply the Phase B cross-check.
 
@@ -277,27 +602,41 @@ def evaluate_phase_b_anchor_gate(
           ``passed=None`` if no anchors are available at all (treated by callers
           as "skipped, acceptable").
 
-    Anchor source precedence: Phase A first, then Stage 1 fallback (Phase A's
-    grid does not contain ``hard_swap_b8`` by construction; Stage 1's
-    ``evaluation.json`` does).
+    Anchor source rule: ``hard_swap_b8`` must come from a valid canonical
+    Stage1 run. Phase A can supply ``no_swap`` only.
     """
     pa_dir = phase_a_dir or default_phase_a_outputs_dir()
     s1_dir = stage1_dir or default_stage1_outputs_dir()
+    anchor_rejections: List[str] = []
 
-    phase_a, phase_a_path = load_latest_phase_a_summary(pa_dir, current_parity)
+    phase_a, phase_a_path = load_latest_phase_a_summary(
+        pa_dir,
+        current_parity,
+        allow_unverified_upstream=allow_unverified_upstream,
+        rejections=anchor_rejections,
+    )
     pa_hs: Optional[float] = None
     pa_ns: Optional[float] = None
     if phase_a is not None:
         pa_hs = phase_a_condition_accuracy(phase_a, "hard_swap_b8")
         pa_ns = phase_a_condition_accuracy(phase_a, "no_swap")
+        if pa_hs is not None:
+            _record_rejection(
+                anchor_rejections,
+                "Phase A hard_swap_b8-like row ignored: Phase B treatment "
+                "anchor must come from canonical Stage1 b=8,t=20.",
+            )
 
-    s1_hs, s1_ns, s1_path = load_latest_stage1_hard_swap_b8(s1_dir, current_parity)
-
-    anchor_hs = pa_hs if pa_hs is not None else s1_hs
-    anchor_ns = pa_ns if pa_ns is not None else s1_ns
-    anchor_hs_src = (
-        "phase_a" if pa_hs is not None else ("stage1" if s1_hs is not None else None)
+    s1_hs, s1_ns, s1_path, s1_criteria_passed = load_latest_stage1_hard_swap_b8(
+        s1_dir,
+        current_parity,
+        allow_unverified_upstream=allow_unverified_upstream,
+        rejections=anchor_rejections,
     )
+
+    anchor_hs = s1_hs
+    anchor_ns = pa_ns if pa_ns is not None else s1_ns
+    anchor_hs_src = "stage1" if s1_hs is not None else None
     anchor_ns_src = (
         "phase_a" if pa_ns is not None else ("stage1" if s1_ns is not None else None)
     )
@@ -315,7 +654,9 @@ def evaluate_phase_b_anchor_gate(
         stage1_evaluation_path=s1_path,
         stage1_hard_swap_b8_accuracy=s1_hs,
         stage1_no_swap_accuracy=s1_ns,
+        stage1_criteria_passed=s1_criteria_passed,
         tolerance=tolerance,
+        anchor_rejections=anchor_rejections,
     )
 
     if not sanity:
@@ -376,11 +717,19 @@ def render_anchor_gate_diagnostic(
         )
         lines.append(
             "Common causes: (1) no Phase A / Stage 1 run exists yet; "
-            "(2) all candidate runs were rejected by manifest parity "
-            "(check warnings above for the first mismatched field — the most "
-            "common offender is generation.max_new_tokens differing between "
-            "stage1_main.yaml (256) and stage2_confound.yaml (512))."
+            "(2) all candidate runs were rejected by manifest parity or "
+            "upstream-validity checks (check warnings above for the first "
+            "mismatched field — common offenders are generation.max_new_tokens "
+            "differing between stage1_main.yaml (256) and stage2_confound.yaml "
+            "(512), missing run_status/self_verification metadata, or a "
+            "non-Stage1 hard_swap_b8 source)."
         )
+    if result.anchor_rejections:
+        lines.append("Rejected anchor candidates:")
+        for msg in result.anchor_rejections[:10]:
+            lines.append(f"  - {msg}")
+        if len(result.anchor_rejections) > 10:
+            lines.append(f"  - ... {len(result.anchor_rejections) - 10} more")
     if result.failed_anchors:
         lines.append("Cross-check FAILED — anchor(s) outside tolerance:")
         for f in result.failed_anchors:
@@ -389,6 +738,21 @@ def render_anchor_gate_diagnostic(
             "This means the current Phase B no_patch / clean_baseline accuracy "
             "does not reproduce a prior parity-compatible run within tolerance "
             f"{result.tolerance}. Investigate seed / decode / model-revision drift."
+        )
+    # Advisory note: surface stage1_criteria_passed=False so an operator
+    # investigating an anchor failure can see whether the Stage 1 sweep that
+    # supplied the hard_swap_b8 anchor itself failed its 2-of-3 criteria.
+    # This is informational; it never causes the gate itself to fail.
+    if (
+        result.stage1_criteria_passed is False
+        and result.anchor_hard_swap_source == "stage1"
+    ):
+        lines.append(
+            "Advisory: the Stage 1 run supplying the hard_swap_b8 anchor has "
+            "criteria.passed=False (operational stability indicator). The "
+            "anchor's accuracy is still reproducible against parity, so the "
+            "cross-check above is the relevant gate; consider whether to "
+            "regenerate the Stage 1 sweep before publishing claims."
         )
     if not lines:
         return ""

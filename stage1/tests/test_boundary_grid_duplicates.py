@@ -67,3 +67,52 @@ def test_duplicate_check_runs_before_range_check():
     cfg = _make([8, 8])
     with pytest.raises(ValueError, match="duplicate"):
         cfg.validate()
+
+
+# ─── Pre-main-run hardening: dataset.lang whitelist ─────────────────────────
+
+
+def _make_with_lang(lang: str):
+    return Stage1Config(
+        models=ModelsConfig(recipient="r", donor="d"),
+        boundary_grid=[2, 4, 6],
+        t_fixed=20,
+        reference=ReferenceConfig(b_ref=8, t_ref=20),
+        hidden_state=HiddenStateConfig(),
+        random_donor=RandomDonorConfig(),
+        dataset=DatasetConfig(lang=lang),
+        generation=GenerationConfig(),
+        evaluation=EvaluationConfig(),
+    )
+
+
+def test_dataset_lang_zh_passes():
+    """Production lang for the project: must validate."""
+    _make_with_lang("zh").validate()
+
+
+def test_dataset_lang_default_te_passes():
+    """The dataclass default lang must remain in the whitelist."""
+    cfg = Stage1Config(
+        models=ModelsConfig(recipient="r", donor="d"),
+        boundary_grid=[2, 4, 6],
+        t_fixed=20,
+        reference=ReferenceConfig(b_ref=8, t_ref=20),
+        hidden_state=HiddenStateConfig(),
+        random_donor=RandomDonorConfig(),
+        dataset=DatasetConfig(),  # default lang
+        generation=GenerationConfig(),
+        evaluation=EvaluationConfig(),
+    )
+    cfg.validate()  # no raise
+
+
+def test_dataset_lang_unknown_raises():
+    """Unknown / mistyped lang must be rejected before the loader is invoked."""
+    with pytest.raises(ValueError, match="not a known MGSM language"):
+        _make_with_lang("xx").validate()
+
+
+def test_dataset_lang_empty_string_raises():
+    with pytest.raises(ValueError, match="not a known MGSM language"):
+        _make_with_lang("").validate()

@@ -166,13 +166,24 @@ def _git_sha() -> str:
 
 
 def _state_dict_sha256(model: torch.nn.Module) -> str:
-    """Deterministic SHA-256 over the model's state_dict tensor bytes."""
+    """Deterministic SHA-256 over the model's state_dict tensor bytes.
+
+    Implementation notes:
+        * Tensors are moved to CPU and made contiguous before hashing so the
+          byte layout is independent of device and stride.
+        * The original tensor dtype is preserved (no float32 cast). Stage 1
+          loads weights at a single dtype (``torch.float16`` by default in
+          ``composer.load_models``); the hash is therefore deterministic
+          across re-runs of the same model + revision + dtype combo, which
+          is what the spec §10 test #4 ("composed weights unchanged across
+          all patched inference passes") actually checks.
+        * Keys are sorted so dict iteration order does not affect the digest.
+    """
     h = hashlib.sha256()
     sd = model.state_dict()
     for key in sorted(sd.keys()):
         t = sd[key]
         h.update(key.encode("utf-8"))
-        # Always hash on CPU in contiguous float32 to be deterministic across devices.
         h.update(t.detach().to("cpu").contiguous().numpy().tobytes())
     return h.hexdigest()
 
@@ -602,9 +613,13 @@ def run_phase_b(
             )
             both_positive = (best["delta_from_no_patch"] > 0.0
                              and boundary_local["delta_from_no_patch"] > 0.0)
-            gate = both_positive and point > EPSILON_DELTA and ci_lo > 0.0
+            # NB: this boolean is the comparative-sentence gate. Do NOT name it
+            # ``gate`` — the outer-scope ``gate`` is the AnchorGateResult from
+            # ``evaluate_phase_b_anchor_gate`` and must remain accessible to
+            # ``render_anchor_gate_diagnostic`` on the failure path below.
+            comparative_gate = both_positive and point > EPSILON_DELTA and ci_lo > 0.0
             comparative_block = {
-                "fired": gate,
+                "fired": comparative_gate,
                 "best_condition": best["condition"],
                 "best_delta": best["delta_from_no_patch"],
                 "boundary_local_delta": boundary_local["delta_from_no_patch"],
@@ -613,7 +628,7 @@ def run_phase_b(
                 "ci_upper": ci_hi,
                 "epsilon_delta": EPSILON_DELTA,
             }
-            if gate:
+            if comparative_gate:
                 comparative_sentence = (
                     f"Recovery-side intervention at {best['condition']} yields a larger "
                     f"prompt-side accuracy delta than patch_boundary_local "

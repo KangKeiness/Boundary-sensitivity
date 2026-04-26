@@ -1,4 +1,4 @@
-"""Phase C — mediation-style decomposition of Phase B accuracy deltas.
+"""Phase C restoration-style decomposition of Phase B accuracy deltas.
 
 This module is analysis-only. It consumes Phase B per-condition sample-level
 JSONLs and produces ``restoration_effect``, ``residual_effect``, and
@@ -6,8 +6,8 @@ JSONLs and produces ``restoration_effect``, ``residual_effect``, and
 ``sample_id``.
 
 IMPORTANT METHODOLOGICAL CONSTRAINT:
-    Mediation analysis here decomposes accuracy deltas under prompt-side
-    restoration intervention only. It is not a formal NIE/NDE decomposition.
+    This module decomposes accuracy deltas under prompt-side restoration
+    intervention only. It is a descriptive restoration decomposition.
 
 See ``notes/specs/phase_c_mediation.md`` for the authoritative spec.
 """
@@ -511,8 +511,8 @@ def compute_decomposition_table(
         )
 
     # Per-condition restoration_effect (+ per-condition residual_effect and
-    # restoration_proportion). Phase C wording MUST avoid formal NIE/NDE/MP/
-    # causal-mediation terminology in ALL artifacts (RED LIGHT P5).
+    # restoration_proportion). Phase C artifacts use conservative restoration
+    # terminology only.
     rows: List[Dict[str, Any]] = []
     # no_patch is included for audit (trivially 0, 0, 0, n, 0).
     ids_all, (np_vec,) = align_by_sample_id(no_patch)
@@ -547,13 +547,13 @@ def compute_decomposition_table(
         )
         dropped_per_cond[name] = re_res["n_dropped_ids"]
 
-        # Per-condition residual_effect (NDE) = acc(clean) - acc(patched).
-        nde_res = residual_effect(
+        # Per-condition residual_effect = acc(clean) - acc(patched).
+        residual_res = residual_effect(
             clean, patched,
             bootstrap_n=bootstrap_n, seed=seed, ci=ci,
         )
-        # Per-condition restoration_proportion (MP) = NIE / TE.
-        mp_res = restoration_proportion(
+        # Per-condition restoration_proportion = restoration_effect / total_effect.
+        proportion_res = restoration_proportion(
             clean, no_patch, patched,
             bootstrap_n=bootstrap_n, seed=seed, ci=ci,
             epsilon_denom=epsilon_denom,
@@ -566,13 +566,13 @@ def compute_decomposition_table(
             "restoration_effect": re_res["point"],
             "restoration_effect_ci_lo": re_res["ci_lo"],
             "restoration_effect_ci_hi": re_res["ci_hi"],
-            "residual_effect": nde_res["point"],
-            "residual_effect_ci_lo": nde_res["ci_lo"],
-            "residual_effect_ci_hi": nde_res["ci_hi"],
-            "restoration_proportion": mp_res["point"],
-            "restoration_proportion_ci_lo": mp_res["ci_lo"],
-            "restoration_proportion_ci_hi": mp_res["ci_hi"],
-            "restoration_proportion_ci_reason": mp_res["ci_reason"],
+            "residual_effect": residual_res["point"],
+            "residual_effect_ci_lo": residual_res["ci_lo"],
+            "residual_effect_ci_hi": residual_res["ci_hi"],
+            "restoration_proportion": proportion_res["point"],
+            "restoration_proportion_ci_lo": proportion_res["ci_lo"],
+            "restoration_proportion_ci_hi": proportion_res["ci_hi"],
+            "restoration_proportion_ci_reason": proportion_res["ci_reason"],
             "total_effect": total_effect_aligned,
             "n_aligned": re_res["n_aligned"],
         })

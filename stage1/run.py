@@ -13,10 +13,12 @@ Runtime contract:
 """
 
 import argparse
+import builtins
 import gc
 import json
 import logging
 import os
+import sys
 from typing import Optional
 
 import torch
@@ -47,6 +49,44 @@ from stage1.utils.hidden_state_verify import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_CLI_ASCII_REPLACEMENTS = {
+    "\u2192": "->",
+    "\u2190": "<-",
+    "\u2194": "<->",
+    "\u2264": "<=",
+    "\u2265": ">=",
+    "\u0394": "delta",
+    "\u03c1": "rho",
+    "\u2713": "OK",
+}
+
+
+def _ascii_cli_text(text: str) -> str:
+    out = text
+    for src, dst in _CLI_ASCII_REPLACEMENTS.items():
+        out = out.replace(src, dst)
+    return out.encode("ascii", errors="replace").decode("ascii")
+
+
+def _safe_print(*args, **kwargs):
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "\n")
+    file = kwargs.pop("file", sys.stdout)
+    flush = kwargs.pop("flush", False)
+    if kwargs:
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush, **kwargs)
+    if file not in (sys.stdout, sys.stderr):
+        return builtins.print(*args, sep=sep, end=end, file=file, flush=flush)
+    msg = sep.join(str(a) for a in args)
+    file.write(_ascii_cli_text(msg) + end)
+    if flush:
+        file.flush()
+
+
+# Keep UTF-8 artifacts intact; sanitize only stdout/stderr for locale-safe CLI.
+print = _safe_print
 
 
 def verify_results(run_dir: str, in_memory_eval: dict, in_memory_bds: dict,
@@ -288,6 +328,7 @@ def verify_results(run_dir: str, in_memory_eval: dict, in_memory_bds: dict,
         reports = verify_hidden_state_artifacts(
             run_dir,
             expected_sample_ids,
+            expected_condition_names=sorted(expected_conditions),
             expected_layer_count=hs_expected_layers,
             expected_hidden_size=hs_expected_hidden,
             raise_on_error=False,
@@ -308,6 +349,7 @@ def verify_results(run_dir: str, in_memory_eval: dict, in_memory_bds: dict,
         with open(manifest_path, encoding="utf-8") as f:
             manifest = json.load(f)
         manifest["self_verification"] = verification_status
+        manifest["run_status"] = verification_status
         if divergences:
             manifest["self_verification_divergences"] = divergences
         manifest["hidden_state_verification"] = hs_verification

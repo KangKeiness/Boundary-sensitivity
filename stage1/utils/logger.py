@@ -13,9 +13,9 @@ from stage1.utils.provenance import build_runtime_provenance
 
 def create_run_dir(base_dir: str = "stage1/outputs") -> str:
     """Create a timestamped run directory."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = os.path.join(base_dir, f"run_{timestamp}")
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=False)
     return run_dir
 
 
@@ -100,6 +100,7 @@ def save_manifest(
         config_path: Optional path to the YAML, surfaced in runtime_provenance.
     """
     manifest = {
+        "phase": "Stage1",
         "timestamp": datetime.now().isoformat(),
         "config": {
             "models": {

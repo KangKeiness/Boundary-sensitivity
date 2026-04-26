@@ -766,11 +766,25 @@ def test_anchor_gate_public_loader_resolves_explicit_path(monkeypatch, tmp_path)
     summary_payload = {
         "all_conditions": [{"condition": "hard_swap_b8", "accuracy": 0.32}],
         "baseline_accuracy": 0.80,
+        "run_status": "passed",
     }
     (run_dir / "phase_a_summary.json").write_text(
         _json.dumps(summary_payload), encoding="utf-8",
     )
-    # Parity disabled here (current_parity=None), so manifest is optional.
+    manifest_payload = {
+        "phase": "A",
+        "run_status": "passed",
+        "hidden_state_verification": {
+            "all_ok": True,
+            "artifacts": [
+                {"condition": "no_swap", "ok": True},
+            ],
+        },
+    }
+    (run_dir / "manifest.json").write_text(
+        _json.dumps(manifest_payload), encoding="utf-8",
+    )
+    # Parity is disabled here, but validity metadata is still required.
     monkeypatch.chdir(tmp_path.parent)
     summary, path = ag.load_latest_phase_a_summary(str(tmp_path), current_parity=None)
     assert summary is not None
