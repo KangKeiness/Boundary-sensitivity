@@ -45,6 +45,14 @@ class RandomDonorConfig:
     seed: int = 42
 
 
+# MGSM upstream covers these 11 languages. Any value outside this set will be
+# rejected by Stage1Config.validate() to defend against typos / missing
+# ``dataset.lang`` keys silently falling back to the dataclass default.
+_KNOWN_MGSM_LANGS: set = {
+    "bn", "de", "en", "es", "fr", "ja", "ru", "sw", "te", "th", "zh",
+}
+
+
 @dataclass
 class DatasetConfig:
     name: str = "mgsm"
@@ -110,6 +118,14 @@ class Stage1Config:
             raise ValueError("Reference b_ref must be less than t_ref")
         if self.dataset.debug_n is not None and self.dataset.debug_n <= 0:
             raise ValueError("debug_n must be positive or null")
+        # Pre-main-run hardening: MGSM lang must be one of the 11 upstream
+        # languages. Catches typos and missing ``dataset.lang`` keys before
+        # the loader tries to fetch a non-existent TSV.
+        if self.dataset.lang not in _KNOWN_MGSM_LANGS:
+            raise ValueError(
+                f"dataset.lang={self.dataset.lang!r} is not a known MGSM "
+                f"language. Expected one of {sorted(_KNOWN_MGSM_LANGS)}."
+            )
 
 
 def load_config(config_path: str) -> Stage1Config:

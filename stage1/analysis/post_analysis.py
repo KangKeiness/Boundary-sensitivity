@@ -189,7 +189,7 @@ def _infer_b_for_condition(cond: str, run_data: Dict) -> int:
 
 # ─── Loading ─────────────────────────────────────────────────────────────────
 
-def load_run(run_dir: str) -> Dict:
+def load_run(run_dir: str, *, allow_partial_hidden_states: bool = False) -> Dict:
     """
     Load all saved artifacts from a completed run directory.
 
@@ -202,6 +202,9 @@ def load_run(run_dir: str) -> Dict:
     Args:
         run_dir: Path to the run directory, e.g.
                  /workspace/outputs/run_20260405_130326/
+        allow_partial_hidden_states: Debugging override. When False (default),
+                 corrupt hidden-state artifacts raise immediately instead of
+                 being skipped.
 
     Returns:
         Dict with keys:
@@ -246,7 +249,10 @@ def load_run(run_dir: str) -> Dict:
                 hidden_states[cond] = hs_dict
                 logger.info("Loaded hidden states for %s (%d samples)", cond, len(hs_dict))
             except Exception as exc:
-                logger.warning("Could not load %s: %s — skipping condition %s", fname, exc, cond)
+                msg = f"Could not load {fname}: {exc}"
+                if not allow_partial_hidden_states:
+                    raise RuntimeError(msg) from exc
+                logger.warning("%s; skipping condition %s", msg, cond)
 
     return {
         "hidden_states": hidden_states,
@@ -775,7 +781,7 @@ def compute_bpd_degradation_correlation(
 
 # ─── Summary report ──────────────────────────────────────────────────────────
 
-def print_summary(run_dir: str) -> None:
+def print_summary(run_dir: str, *, allow_partial_hidden_states: bool = False) -> None:
     """
     Load a completed run and print a comparison table of all metrics.
 
@@ -790,7 +796,10 @@ def print_summary(run_dir: str) -> None:
     print(f"\n=== Post-Analysis Summary ===")
     print(f"Run: {os.path.abspath(run_dir)}")
 
-    run_data = load_run(run_dir)
+    run_data = load_run(
+        run_dir,
+        allow_partial_hidden_states=allow_partial_hidden_states,
+    )
     bpd_results = compute_bpd_sweep(run_data)
     corr = compute_bpd_degradation_correlation(
         run_data["boundary_grid"], bpd_results, run_data["evaluation"]
@@ -1180,6 +1189,14 @@ def _parse_args() -> argparse.Namespace:
         help="Treat run_dir as a Phase A run and print primary two-grid tables.",
     )
     parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=(
+            "Debugging only: skip corrupt Stage1 hidden-state artifacts instead "
+            "of failing closed."
+        ),
+    )
+    parser.add_argument(
         "--log_level",
         default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1197,7 +1214,10 @@ def main() -> None:
     if args.phase_a:
         print_phase_a_summary(args.run_dir)
     else:
-        print_summary(args.run_dir)
+        print_summary(
+            args.run_dir,
+            allow_partial_hidden_states=args.allow_partial,
+        )
 
 
 if __name__ == "__main__":
