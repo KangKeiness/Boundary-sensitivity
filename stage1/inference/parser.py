@@ -2,7 +2,8 @@
 
 import logging
 import re
-from typing import Dict
+import math
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +73,21 @@ def parse_answer(output_text: str) -> Dict:
     }
 
 
-def _normalize_number(raw: str) -> str:
+def _normalize_number(raw: str) -> Optional[str]:
     """Strip whitespace, remove commas, normalize numeric string."""
     s = raw.strip().replace(",", "")
     if s.endswith("."):
         s = s[:-1]
     # Convert to int if possible (drops ".0")
     try:
-        s = str(int(float(s))) if "." not in s else s
+        if "." not in s:
+            try:
+                value = float(s)
+                if not math.isfinite(value):
+                    return None
+                s = str(int(value))
+            except (ValueError, OverflowError):
+                return None
     except ValueError:
         pass
     return s
