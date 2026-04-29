@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import inspect
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -503,19 +503,108 @@ def extract_all_layer_hidden_states(
 
 # ─── Main patched inference ──────────────────────────────────────────────────
 
+def _normalize_stop_token_ids(
+    eos_token_id: Optional[Union[int, Iterable[int]]] = None,
+    stop_token_ids: Optional[Iterable[int]] = None,
+) -> Set[int]:
+    """Coerce caller-supplied stop-token specs into a single ``Set[int]``.
+
+    Accepts either a scalar / iterable ``eos_token_id`` (HF
+    ``generation_config.eos_token_id`` is a list on Qwen2.5-Instruct), or
+    an explicit ``stop_token_ids`` iterable, or both (their union is
+    returned). ``None`` and negative IDs (e.g., ``unk``) are dropped so the
+    set never contains a poison value that would compare equal to a real
+    emitted token.
+    """
+    out: Set[int] = set()
+    for src in (eos_token_id, stop_token_ids):
+        if src is None:
+            continue
+        if isinstance(src, (int,)):
+            ids: Iterable[int] = [src]
+        elif isinstance(src, torch.Tensor):
+            ids = src.flatten().tolist()
+        else:
+            try:
+                ids = list(src)  # type: ignore[arg-type]
+            except TypeError:
+                ids = [src]  # type: ignore[list-item]
+        for x in ids:
+            if x is None:
+                continue
+            try:
+                xi = int(x)
+            except (TypeError, ValueError):
+                continue
+            if xi < 0:
+                # tokenizer.convert_tokens_to_ids returns -1 / unk for missing
+                # special tokens on some tokenizer flavors; treat as no-op.
+                continue
+            out.add(xi)
+    return out
+
+
 def _greedy_continue_with_cache(
     model: AutoModelForCausalLM,
     first_token_id: torch.Tensor,
     cache,
     prompt_len: int,
     max_new_tokens: int,
-    eos_token_id: Optional[int],
+    eos_token_id: Optional[Union[int, Iterable[int]]] = None,
+    pad_token_id: Optional[int] = None,
+    stop_token_ids: Optional[Iterable[int]] = None,
 ) -> torch.Tensor:
     """Manual greedy decode loop reusing a prompt-seeded ``DynamicCache``.
 
     Per the project constraint in ``CLAUDE.md``/spec: do NOT fall back to
     ``model.generate(current_ids, ...)`` after patching — that would re-run the
     prompt tokens through the unpatched forward and discard the patch.
+
+    Parity contract (spec §8.1, phase_b_revision.md; r2 multi-stop-token fix):
+        Bytewise equivalent to ``model.generate(input_ids, do_sample=False,
+        max_new_tokens=max_new_tokens)[0, prompt_len:]`` on the no-patch path
+        (``patch_layers=[]``). Specifically:
+        - greedy (do_sample=False, temperature=0.0)
+        - stops the moment ANY token in the stop-token set is emitted
+          (batch=1). HF ``generate`` on Qwen2.5-1.5B-Instruct stops on EITHER
+          ``<|im_end|>`` (151645) OR ``<|endoftext|>`` (151643) because
+          ``model.generation_config.eos_token_id == [151645, 151643]``. The
+          r1 manual loop checked only against ``tokenizer.eos_token_id``
+          (151645), so when the model emitted 151643 first it failed to stop
+          and continued into the literal text ``"\n\nHuman: ..."``. The r2
+          fix accepts a *set* of stop-token IDs and stops on any match.
+        - DOES NOT append any tokens after the first stop token for that
+          sample.
+        - the returned tensor is hard-truncated at the stop step so no
+          post-stop token IDs leak into ``tokenizer.decode``. This is the
+          fix for the long ``Human:`` continuation observed in the failed
+          ``run_20260428_071043_694696`` (see brief §A) and reproduced in
+          the r1 sanity smoke ``run_20260429_094926_429332`` (5/5 Human
+          continuations on a chat-trained model with a non-chat-template
+          plain-text prompt).
+
+    Implementation note (the bug history):
+        - r0 → r1: the loop checked ``int(current.item()) == eos_token_id``
+          AFTER feeding ``current`` through the model — i.e., one extra
+          forward step always happened at the EOS token. r1 moved the
+          finished-check to the TOP of the loop and added explicit
+          truncation-at-EOS. That part is preserved here.
+        - r1 → r2: r1 still tested against a single ``eos_token_id``
+          equal to ``tokenizer.eos_token_id`` (151645 on Qwen2.5-Instruct).
+          Qwen2.5-Instruct's ``model.generation_config.eos_token_id`` is a
+          two-element list ``[151645, 151643]``; HF generate stops on
+          either. When the recipient/composed model emits 151643 first
+          (which it does on the Phase B plain-text prompt), the r1 loop
+          missed the stop and continued. r2 accepts a ``stop_token_ids``
+          set built from the union of every stop-token signal that
+          ``model.generate`` would honor.
+
+    Backward-compat:
+        ``eos_token_id`` is retained as a keyword-only argument so existing
+        unit tests that pass a single scalar EOS continue to work; it is
+        unioned into the internal stop-token set. Passing both
+        ``eos_token_id`` and ``stop_token_ids`` is supported (their union
+        is the active stop set).
 
     Args:
         model: The patched model.
@@ -525,19 +614,50 @@ def _greedy_continue_with_cache(
             ``forward_with_patches``).
         prompt_len: Number of prompt tokens already in the cache.
         max_new_tokens: Total max new tokens INCLUDING ``first_token_id``.
-        eos_token_id: Stop token. ``None`` disables early stop.
+        eos_token_id: Single ID or iterable of IDs. Each entry is unioned
+            into the stop-token set. ``None`` is treated as "no scalar
+            EOS"; combine with ``stop_token_ids`` for chat-template stops.
+        pad_token_id: Reserved for parity with HF generate's truncation
+            mechanism. Not used by the current hard-truncation path; accepted
+            so callers can pass it without a TypeError. Documented in spec
+            §8.1.
+        stop_token_ids: Explicit iterable of stop-token IDs. Unioned with
+            ``eos_token_id`` to form the active stop-token set. Pass this
+            in ``run_patched_inference_single`` so the loop honors every
+            stop signal HF ``generate`` would honor.
 
     Returns:
-        LongTensor [K] of generated token IDs (``K <= max_new_tokens``), on CPU.
+        LongTensor [K] of generated token IDs (``K <= max_new_tokens``), on
+        CPU. ``K`` is the count INCLUDING the first stop token (when
+        emitted) and EXCLUDING any post-stop tokens.
     """
+    del pad_token_id  # Reserved for parity-with-HF-pad-truncation; not needed.
+
+    stop_set: Set[int] = _normalize_stop_token_ids(
+        eos_token_id=eos_token_id, stop_token_ids=stop_token_ids,
+    )
+
     device = first_token_id.device
-    generated = [first_token_id.view(1, 1)]
+    generated: List[torch.Tensor] = [first_token_id.view(1, 1)]
     current = first_token_id.view(1, 1)
 
+    # Per-sample finished mask (batch=1 here, so a scalar bool). If the very
+    # first token IS in the stop set, we are done immediately and must not run
+    # any autoregressive forwards; truncation below keeps the stop token itself.
+    finished = bool(stop_set) and int(current.item()) in stop_set
+
     remaining = max_new_tokens - 1
+    forward_params = inspect.signature(model.forward).parameters
+    accepts_cache_position = "cache_position" in forward_params
+    accepts_position_ids = "position_ids" in forward_params
+
     for step in range(remaining):
-        if eos_token_id is not None and int(current.item()) == int(eos_token_id):
+        # Spec §8.1: check finished at TOP of loop, BEFORE the next forward.
+        # This is the parity-with-generate fix; the old loop ran one extra
+        # forward at the EOS step and appended a post-EOS token.
+        if finished:
             break
+
         # The first generated token occupies absolute position `prompt_len`
         # (prompt tokens live at 0..prompt_len-1). At loop step=0 we are feeding
         # that first token into the model to compute its representation, so the
@@ -547,23 +667,39 @@ def _greedy_continue_with_cache(
         position_ids = cache_position.unsqueeze(0)
 
         with torch.no_grad():
-            forward_params = inspect.signature(model.forward).parameters
             model_kwargs = {
                 "input_ids": current,
                 "past_key_values": cache,
                 "use_cache": True,
             }
-            if "cache_position" in forward_params:
+            if accepts_cache_position:
                 model_kwargs["cache_position"] = cache_position
-            if "position_ids" in forward_params:
+            if accepts_position_ids:
                 model_kwargs["position_ids"] = position_ids
             outputs = model(**model_kwargs)
         logits = outputs.logits[:, -1, :]
         next_id = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1]
         generated.append(next_id)
         current = next_id
+        if stop_set and int(next_id.item()) in stop_set:
+            finished = True
 
-    return torch.cat(generated, dim=1).squeeze(0).to("cpu")
+    # Hard-truncate at the (inclusive) first-stop index: keep tokens up to and
+    # including the first stop, drop everything after. When no stop fires,
+    # this is a no-op.
+    out = torch.cat(generated, dim=1).squeeze(0).to("cpu")
+    if stop_set:
+        # Find the first occurrence of ANY stop-token ID. Vectorised: build a
+        # boolean mask via membership (loop over stop_set is fine — typical
+        # set size is ≤ 3) and take argmax of the cumulative-or to locate it.
+        mask = torch.zeros_like(out, dtype=torch.bool)
+        for sid in stop_set:
+            mask = mask | (out == int(sid))
+        positions = mask.nonzero(as_tuple=False)
+        if positions.numel() > 0:
+            cut = int(positions[0].item()) + 1  # inclusive of stop token
+            out = out[:cut]
+    return out
 
 
 def run_patched_inference_single(
@@ -663,6 +799,63 @@ def run_patched_inference_single(
         first_token_id = torch.argmax(first_token_logits, dim=-1).view(1, 1)
 
         eos_id = getattr(tokenizer, "eos_token_id", None)
+        # Pass pad_token_id (or eos_token_id when pad is None) — this mirrors
+        # what HF generate uses internally when no pad is set, and is reserved
+        # for the truncation mechanism per spec §8.1. The current
+        # hard-truncation path does not consume it, but the parameter is wired
+        # so a future pad-based path stays bytewise-equivalent without an API
+        # change.
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = eos_id
+
+        # r2 multi-stop-token fix: build the stop-token set as the union of
+        # every signal HF ``generate`` would stop on. On Qwen2.5-1.5B-Instruct
+        # this is two IDs:
+        #   - ``tokenizer.eos_token_id`` (=== 151645, the chat-template
+        #     ``<|im_end|>`` token)
+        #   - ``model.generation_config.eos_token_id`` (=== ``[151645, 151643]``;
+        #     the second is ``<|endoftext|>``)
+        # On the Phase B plain-text prompt the model emits ``<|endoftext|>``
+        # (151643) — a non-chat-template stop. The r1 loop only checked 151645
+        # so it missed the stop and continued into a literal ``Human:``
+        # continuation. The r2 fix unions both sources (and the explicit
+        # ``<|im_end|>`` / ``<|endoftext|>`` IDs from the tokenizer vocabulary
+        # as a defensive belt-and-braces). See spec §8.1 / writer r2 dispatch.
+        stop_token_ids: Set[int] = set()
+        # (1) tokenizer.eos_token_id — single value or list.
+        stop_token_ids |= _normalize_stop_token_ids(
+            eos_token_id=eos_id,
+        )
+        # (2) model.generation_config.eos_token_id — list on Qwen2.5-Instruct.
+        gen_cfg = getattr(model, "generation_config", None)
+        gc_eos = getattr(gen_cfg, "eos_token_id", None) if gen_cfg is not None else None
+        stop_token_ids |= _normalize_stop_token_ids(eos_token_id=gc_eos)
+        # (3) Tokenizer vocabulary lookups for the chat-template tokens.
+        for tok_str in ("<|im_end|>", "<|endoftext|>"):
+            try:
+                tid = tokenizer.convert_tokens_to_ids(tok_str)
+            except Exception:
+                tid = None
+            if tid is None:
+                continue
+            try:
+                tid_int = int(tid)
+            except (TypeError, ValueError):
+                continue
+            # convert_tokens_to_ids returns the unk-id (often non-negative on
+            # some BPE tokenizers) for unknown tokens; defensively skip when
+            # it equals the unk_token_id.
+            unk = getattr(tokenizer, "unk_token_id", None)
+            if unk is not None:
+                try:
+                    if tid_int == int(unk):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            if tid_int >= 0:
+                stop_token_ids.add(tid_int)
+
         generated_ids = _greedy_continue_with_cache(
             model=model,
             first_token_id=first_token_id,
@@ -670,7 +863,36 @@ def run_patched_inference_single(
             prompt_len=prompt_len,
             max_new_tokens=gen_kwargs["max_new_tokens"],
             eos_token_id=eos_id,
+            pad_token_id=pad_id,
+            stop_token_ids=stop_token_ids,
         )
+
+        # Spec §8.1: defensive parity assertion in DEBUG-ONLY mode. When
+        # PHASE_B_PARITY_DEBUG=1 is set in the environment AND this is the
+        # no-patch path, additionally call ``model.generate`` with the same
+        # generation_config and assert tensor equality of the continuation.
+        # NOT in the default code path (no inference cost in production).
+        import os as _os
+        if (
+            not patch_config.patch_layers
+            and _os.environ.get("PHASE_B_PARITY_DEBUG") == "1"
+        ):
+            ref_out = model.generate(
+                input_ids,
+                do_sample=False,
+                max_new_tokens=gen_kwargs["max_new_tokens"],
+            )
+            ref_new = ref_out[0, prompt_len:].to("cpu")
+            # Compare on the shared prefix (greedy with hard EOS truncation
+            # ⇒ both stop at the same EOS step ⇒ identical tensors).
+            k = min(int(generated_ids.shape[0]), int(ref_new.shape[0]))
+            if k == 0 or not torch.equal(generated_ids[:k], ref_new[:k]):
+                raise RuntimeError(
+                    "PHASE_B_PARITY_DEBUG: no-patch greedy decode diverged "
+                    f"from model.generate at first {k} tokens; "
+                    f"manual={generated_ids[:k].tolist()} "
+                    f"generate={ref_new[:k].tolist()}"
+                )
 
     output_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 

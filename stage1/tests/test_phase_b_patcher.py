@@ -793,6 +793,459 @@ def test_anchor_gate_public_loader_resolves_explicit_path(monkeypatch, tmp_path)
     assert "run_20991231_000000" in path
 
 
+# ─── phase_b_revision §8.4 — generation parity + subset construction tests ──
+
+@requires_torch
+def test_eos_stop_no_post_eos_emission():
+    """_greedy_continue_with_cache must NOT emit any tokens after EOS.
+
+    phase_b_revision §8.4 / §10 test #2. Uses a stub model that emits a
+    fixed EOS at step k; the returned tensor MUST have length == k+1
+    (inclusive of EOS) and MUST NOT contain any token at index > k.
+    """
+    import torch
+
+    from stage1.intervention.patcher import _greedy_continue_with_cache
+
+    EOS_ID = 7
+
+    class _StubLogits:
+        def __init__(self, vec: torch.Tensor):
+            self.logits = vec
+
+    class _StubModel:
+        """Forward returns a fixed logits sequence: argmax = step_index, then EOS."""
+        def __init__(self, eos_step: int, vocab_size: int = 16):
+            self.eos_step = eos_step
+            self.vocab_size = vocab_size
+            self.calls = 0
+            # Deterministic, no real attention, no params.
+
+        def forward(self, input_ids=None, past_key_values=None,
+                    use_cache=None, cache_position=None,
+                    position_ids=None):
+            # step index counts forward calls (each call processes 1 token).
+            step = self.calls
+            self.calls += 1
+            logits = torch.full(
+                (1, 1, self.vocab_size), -1e9, dtype=torch.float32,
+            )
+            # Step 0 → emit token "1"; step k-1 → EOS; step >= k → EOS.
+            if step >= self.eos_step - 1:
+                logits[0, 0, EOS_ID] = 1.0
+            else:
+                logits[0, 0, step + 1] = 1.0
+            return _StubLogits(logits)
+
+        __call__ = forward
+
+    eos_step = 3  # The 4th generated token (index 3) is EOS.
+    model = _StubModel(eos_step=eos_step)
+    first_token_id = torch.tensor([[1]], dtype=torch.long)
+    out = _greedy_continue_with_cache(
+        model=model,
+        first_token_id=first_token_id,
+        cache=None,
+        prompt_len=5,
+        max_new_tokens=20,
+        eos_token_id=EOS_ID,
+    )
+    # Expected: [1, 2, 3, EOS]; total length 4 (eos_step + 1).
+    assert out.dim() == 1
+    assert int(out.shape[0]) == eos_step + 1, (
+        f"expected length {eos_step + 1}, got {int(out.shape[0])}: {out.tolist()}"
+    )
+    assert int(out[-1].item()) == EOS_ID, (
+        f"last token must be EOS; got {out.tolist()}"
+    )
+    # No post-EOS tokens.
+    eos_positions = (out == EOS_ID).nonzero(as_tuple=False)
+    first_eos = int(eos_positions[0].item())
+    assert first_eos == int(out.shape[0]) - 1, (
+        f"EOS must be the last token; got first_eos={first_eos}, "
+        f"len={int(out.shape[0])}: {out.tolist()}"
+    )
+
+
+@requires_torch
+def test_no_patch_generate_byte_equal_full_subset_smoke():
+    """patch_layers=[] greedy decode is bytewise equal to model.generate.
+
+    phase_b_revision §8.4 / §10 test #3. Five fixture prompts via a tiny
+    ad-hoc Qwen2 config (no real weights) — the contract is that the
+    manual loop with a no-op patch set produces the SAME continuation as
+    ``model.generate(do_sample=False)``.
+    """
+    import torch
+    from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+    from stage1.intervention.patcher import (
+        PatchConfig, run_patched_inference_single,
+    )
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(
+        vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=128, rope_theta=10000.0,
+    )
+    model = Qwen2ForCausalLM(cfg).eval()
+
+    class DummyTokenizer:
+        eos_token_id = None
+        pad_token_id = None
+
+        def __call__(self, text, return_tensors=None, padding=False):
+            ids = [b % cfg.vocab_size for b in text.encode("utf-8")[:10]]
+
+            class _O:
+                pass
+            o = _O()
+            o.input_ids = torch.tensor([ids], dtype=torch.long)
+            return o
+
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(str(int(i)) for i in ids)
+
+    tok = DummyTokenizer()
+    pc = PatchConfig("no_patch", [], "restoration")
+
+    fixtures = ["abcdef", "fedcba", "012345", "hello!", "ZxYwVu"]
+    for prompt in fixtures:
+        input_ids = tok(prompt).input_ids
+        prompt_len = input_ids.shape[1]
+        with torch.no_grad():
+            ref_out = model.generate(
+                input_ids,
+                do_sample=False,
+                max_new_tokens=12,
+            )
+        ref_new = ref_out[0, prompt_len:].tolist()
+        result = run_patched_inference_single(
+            model=model,
+            tokenizer=tok,
+            prompt=prompt,
+            patch_config=pc,
+            generation_config={
+                "do_sample": False, "temperature": 0.0,
+                "max_new_tokens": 12,
+            },
+        )
+        patched_new = [int(x) for x in result["output_text"].split()]
+        k = min(len(ref_new), len(patched_new))
+        assert k > 0, f"no tokens generated for prompt {prompt!r}"
+        assert ref_new[:k] == patched_new[:k], (
+            f"byte-equality failed on prompt {prompt!r}: "
+            f"ref={ref_new[:k]}, patched={patched_new[:k]}"
+        )
+
+
+@requires_torch
+def test_eos_stop_on_im_end_only():
+    """``_greedy_continue_with_cache`` MUST stop on ANY token in the stop
+    set, not only on the scalar ``eos_token_id`` argument.
+
+    phase_b_revision r2: Qwen2.5-1.5B-Instruct ``model.generation_config``
+    declares ``eos_token_id == [151645, 151643]`` so HF ``generate`` stops
+    on either ``<|im_end|>`` or ``<|endoftext|>``. The r1 manual loop
+    accepted only a scalar ``eos_token_id`` and missed when the model
+    emitted the *other* member of the list, producing the 5/5 ``Human:``
+    continuation observed in ``run_20260429_094926_429332``. This test
+    constructs a stub model that emits ``<|im_end|>`` ID 151645 at step k
+    while the caller passes ``eos_token_id == 151643`` (so the scalar
+    argument does NOT match the emitted token); the loop must still stop
+    via the ``stop_token_ids`` set.
+
+    Pre-r2 this test FAILS (the loop generates max_new_tokens-1 extra
+    tokens past 151645). Post-r2 it PASSES (stop on 151645 via the set).
+    """
+    import torch
+
+    from stage1.intervention.patcher import _greedy_continue_with_cache
+
+    IM_END = 151645
+    ENDOFTEXT = 151643
+
+    class _StubLogits:
+        def __init__(self, vec: torch.Tensor):
+            self.logits = vec
+
+    class _StubModel:
+        """Step 0 → token 1; step k → emit IM_END; step >k → keep emitting."""
+        def __init__(self, eos_step: int, vocab_size: int = 200_000):
+            self.eos_step = eos_step
+            self.vocab_size = vocab_size
+            self.calls = 0
+
+        def forward(self, input_ids=None, past_key_values=None,
+                    use_cache=None, cache_position=None,
+                    position_ids=None):
+            step = self.calls
+            self.calls += 1
+            logits = torch.full(
+                (1, 1, self.vocab_size), -1e9, dtype=torch.float32,
+            )
+            if step >= self.eos_step - 1:
+                logits[0, 0, IM_END] = 1.0
+            else:
+                # Pick a benign non-stop ID.
+                logits[0, 0, (step + 1) % 100] = 1.0
+            return _StubLogits(logits)
+
+        __call__ = forward
+
+    eos_step = 3  # 4th generated token (index 3) is IM_END.
+    model = _StubModel(eos_step=eos_step)
+    first_token_id = torch.tensor([[1]], dtype=torch.long)
+
+    # CRITICAL: eos_token_id (scalar) is ENDOFTEXT — the *wrong* member of
+    # generation_config.eos_token_id. The loop must stop because IM_END is
+    # in stop_token_ids, NOT because it equals eos_token_id.
+    out = _greedy_continue_with_cache(
+        model=model,
+        first_token_id=first_token_id,
+        cache=None,
+        prompt_len=5,
+        max_new_tokens=64,
+        eos_token_id=ENDOFTEXT,                  # <-- scalar mismatch
+        stop_token_ids={IM_END, ENDOFTEXT},      # <-- union; both honored
+    )
+    # Pre-r2 (stop_token_ids unhonored): out has length close to 64; last
+    # token is NOT IM_END.
+    # Post-r2: out has length eos_step + 1 = 4; last token is IM_END.
+    assert int(out.shape[0]) == eos_step + 1, (
+        f"r2 multi-stop fix failed: expected length {eos_step + 1}, "
+        f"got {int(out.shape[0])}: {out.tolist()}"
+    )
+    assert int(out[-1].item()) == IM_END, (
+        f"last token must be IM_END (151645); got {out.tolist()}"
+    )
+
+
+@requires_torch
+def test_no_human_continuation_in_clean_no_patch_smoke():
+    """clean_no_patch decoded outputs MUST NOT contain ``Human:`` on the
+    SAME code path that ``run_phase_b --sanity`` exercises.
+
+    phase_b_revision §8.4 / §10 test #4 (r2 refactor — fixes the r1
+    fixture-divergence bug).
+
+    r1 problem: this test used a tiny ad-hoc ``Qwen2Config(vocab_size=256)``
+    model with a ``DummyTokenizer`` whose ``decode`` was
+    ``" ".join(str(int(i)) for i in ids)`` — i.e., it emitted whitespace-
+    separated digit strings that by construction can NEVER contain the
+    substring ``Human:``. The test PASSED on the r1 unfixed code while
+    the real ``run_phase_b --sanity`` produced 5/5 ``Human:`` continuations
+    on the same fixture. The fixture exercised a different code path than
+    the real run did: in particular it used ``eos_token_id = None`` so the
+    r1 loop's missing multi-stop-token handling could not be tested.
+
+    r2 fix: drive a real ``AutoTokenizer`` (Qwen2.5-1.5B-Instruct) through
+    the SAME ``run_patched_inference_single`` path the real sanity run
+    uses, with the SAME plain-text MGSM prompt template (matching
+    ``stage1/data/loader.py::PROMPT_TEMPLATE``). The model is the tiny
+    ad-hoc Qwen2 used elsewhere in this file (no real weights — so the
+    test does not require GPU + cached weights), but the tokenizer is
+    real, the prompt is real-shape, and the stop-token-set construction
+    (``tokenizer.eos_token_id`` + ``model.generation_config.eos_token_id``
+    + ``convert_tokens_to_ids("<|im_end|>"|"<|endoftext|>")``) goes
+    through the same codepath as production.
+
+    The decoded output is short by construction (random ad-hoc weights
+    rarely emit any of the stop tokens; the loop hits ``max_new_tokens``
+    quickly), and we add a defensive ``"<|im_start|>user"`` substring
+    check too — this is the spec-§7.2.4-style "output contains a chat-
+    template stop turn token, decoded as raw text because
+    ``skip_special_tokens=True`` failed" guard.
+
+    The test is auto-skipped if the real Qwen tokenizer cannot be loaded
+    (no network, no cache). Pre-r2 the test would FAIL on real-weight
+    runs; post-r2 it PASSES.
+    """
+    import torch
+    from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+    from stage1.intervention.patcher import (
+        PatchConfig, run_patched_inference_single,
+    )
+
+    # Real Qwen tokenizer — captures the multi-stop-token contract the bug
+    # depends on. Use ``local_files_only=True`` first, fall back to network
+    # if cached weights are absent (tokenizer fetch is small).
+    try:
+        from transformers import AutoTokenizer
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                "Qwen/Qwen2.5-1.5B-Instruct", local_files_only=True,
+            )
+        except Exception:
+            tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    except Exception as exc:
+        pytest.skip(
+            f"Real Qwen tokenizer unavailable in sandbox: {exc!r}. "
+            f"Test requires either cached weights or network access."
+        )
+
+    # Build a tiny ad-hoc Qwen2 model whose vocab matches the real tokenizer
+    # so encode/decode round-trips never out-of-range. Random weights — so
+    # the test does NOT need GPU or cached real weights.
+    vocab_size = int(getattr(tok, "vocab_size", 0) or len(tok))
+    if vocab_size <= 1000:
+        # Defensive: if AutoTokenizer reports a tiny vocab, abort cleanly.
+        pytest.skip(f"Qwen tokenizer reported tiny vocab_size={vocab_size}")
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(
+        vocab_size=vocab_size,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+    )
+    # Patch generation_config.eos_token_id to match Qwen2.5-Instruct's
+    # production list so the stop-token-set construction in
+    # run_patched_inference_single sees a list (not a scalar).
+    model = Qwen2ForCausalLM(cfg).eval()
+    # Production: model.generation_config.eos_token_id == [151645, 151643]
+    im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+    endoftext_id = tok.convert_tokens_to_ids("<|endoftext|>")
+    if im_end_id is not None and endoftext_id is not None:
+        model.generation_config.eos_token_id = [int(im_end_id), int(endoftext_id)]
+
+    pc = PatchConfig("clean_no_patch", [], "restoration")
+
+    # Match stage1/data/loader.py::PROMPT_TEMPLATE exactly so the prompt is
+    # the SAME shape run_phase_b --sanity feeds the patcher.
+    prompt_template = (
+        "Solve the following math problem step by step. "
+        "Show your reasoning first, then write your final answer on the "
+        "last line in this exact format: 'The answer is X.' where X is "
+        "the numeric answer.\n\n"
+        "Problem: {question}\n"
+        "Solution:"
+    )
+    fixtures_questions = [
+        "If a triangle has sides 3, 4, 5, what is its area?",
+        "What is 12 plus 7?",
+        "How many hours are in three days?",
+        "Compute 144 divided by 12.",
+        "Sum the integers from 1 to 10.",
+    ]
+
+    for question in fixtures_questions:
+        prompt = prompt_template.format(question=question)
+        result = run_patched_inference_single(
+            model=model,
+            tokenizer=tok,
+            prompt=prompt,
+            patch_config=pc,
+            generation_config={
+                "do_sample": False, "temperature": 0.0,
+                "max_new_tokens": 64,
+            },
+        )
+        out_text = result["output_text"]
+        # Primary assertion: no chat-turn continuation in decoded text.
+        assert "Human:" not in out_text, (
+            f"clean_no_patch produced Human: continuation on prompt "
+            f"(question={question!r}): {out_text!r}"
+        )
+        # Defensive: skip_special_tokens=True should drop the literal
+        # ``<|im_start|>user`` token; if it appears in decoded text the
+        # decode contract is broken.
+        assert "<|im_start|>user" not in out_text, (
+            f"clean_no_patch decoded a literal <|im_start|>user — "
+            f"skip_special_tokens=True is not honored: {out_text!r}"
+        )
+
+
+@requires_torch
+def test_no_second_human_turn_in_no_patch_decode():
+    """Regression guard: decoded ``clean_no_patch`` text must not embed a
+    chat-template turn marker even when the prompt is plain text.
+
+    phase_b_revision r2: defensive twin of
+    ``test_no_human_continuation_in_clean_no_patch_smoke``. Specifically
+    asserts on a single fixture prompt that BOTH ``"Human:"`` (the
+    decoded-text symptom) AND ``"<|im_start|>user"`` (the special-token
+    leak symptom) are absent. The presence of either is the symptom of
+    the failed run ``run_20260428_071043_694696`` and the r1 sanity smoke
+    ``run_20260429_094926_429332``.
+    """
+    import torch
+    from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+    from stage1.intervention.patcher import (
+        PatchConfig, run_patched_inference_single,
+    )
+
+    try:
+        from transformers import AutoTokenizer
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                "Qwen/Qwen2.5-1.5B-Instruct", local_files_only=True,
+            )
+        except Exception:
+            tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    except Exception as exc:
+        pytest.skip(
+            f"Real Qwen tokenizer unavailable in sandbox: {exc!r}"
+        )
+
+    vocab_size = int(getattr(tok, "vocab_size", 0) or len(tok))
+    if vocab_size <= 1000:
+        pytest.skip(f"Qwen tokenizer reported tiny vocab_size={vocab_size}")
+
+    torch.manual_seed(7)
+    cfg = Qwen2Config(
+        vocab_size=vocab_size,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+    )
+    model = Qwen2ForCausalLM(cfg).eval()
+    im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+    endoftext_id = tok.convert_tokens_to_ids("<|endoftext|>")
+    if im_end_id is not None and endoftext_id is not None:
+        model.generation_config.eos_token_id = [int(im_end_id), int(endoftext_id)]
+
+    pc = PatchConfig("clean_no_patch", [], "restoration")
+
+    prompt = (
+        "Solve the following math problem step by step. "
+        "Show your reasoning first, then write your final answer on the "
+        "last line in this exact format: 'The answer is X.' where X is "
+        "the numeric answer.\n\n"
+        "Problem: What is 2 plus 3?\n"
+        "Solution:"
+    )
+    result = run_patched_inference_single(
+        model=model,
+        tokenizer=tok,
+        prompt=prompt,
+        patch_config=pc,
+        generation_config={
+            "do_sample": False, "temperature": 0.0,
+            "max_new_tokens": 64,
+        },
+    )
+    out_text = result["output_text"]
+    assert "Human:" not in out_text, (
+        f"clean_no_patch decoded text contains 'Human:': {out_text!r}"
+    )
+    assert "<|im_start|>user" not in out_text, (
+        f"clean_no_patch decoded text contains '<|im_start|>user' — "
+        f"skip_special_tokens=True is not honored: {out_text!r}"
+    )
+
+
 @pytest.mark.skipif(
     not _has_gpu_and_weights(),
     reason=(
