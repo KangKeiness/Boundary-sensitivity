@@ -1,0 +1,74 @@
+{
+  "verdict": "PASS",
+  "review_target": {
+    "spec": "notes/specs/phase_b_revision.md",
+    "writer_artifacts": [
+      "notes/handoffs/writer_phase_b_revision.md",
+      "notes/handoffs/writer_phase_b_revision_r2.md"
+    ],
+    "sanity_run_dir": "stage1/outputs/phase_b/run_20260429_181526_288894",
+    "scope": "P0 generation parity narrow fix (r2) on top of conditional metrics layer (r1)"
+  },
+  "spec_conformance": {
+    "matched": [
+      "Stop-token set in run_patched_inference_single is the union of tokenizer.eos_token_id, model.generation_config.eos_token_id, and convert_tokens_to_ids(\"<|im_end|>\"|\"<|endoftext|>\"); negative IDs and unk_token_id are filtered (patcher.py L825-857).",
+      "_greedy_continue_with_cache accepts stop_token_ids and unions with eos_token_id via _normalize_stop_token_ids (patcher.py L506-544, L636-638).",
+      "Finished-mask discipline: check at top of loop (L658) before next forward, hard-truncation at first stop preserves stop token (L687-701), cache_position = prompt_len + step preserved (L665).",
+      "First-token-is-stop corner-case handled (L644-647 — `finished` initialised before loop; truncation step keeps the single stop token).",
+      "Sanity-mode no-patch parity gate fires only on clean_no_patch + restoration_no_patch with thresholds Human:>1 ⇒ fail and avg_len_chars>1000 ⇒ fail (run_phase_b.py L496-559); on hard-fail, summary.failure_reason starts with `\"sanity P0 parity check failed: \"` (L2298-2304) and the failed-branch persistence preserves that prefix over the generic `sanity_check_failed:` prefix (L2375-2389).",
+      "Sanity-mode gate is wired AFTER the existing `\"Human:-continuation parity skipped (sanity, ...)\"` check (L2263) and BEFORE the cross-phase accuracy check (L2322), as per writer description.",
+      "phase_b_summary.json carries additive top-level fields `sanity_parity_status` (`passed`) and `sanity_parity_metrics` matching JSONL-derived counts.",
+      "Files-to-touch adherence: only stage1/intervention/patcher.py, stage1/run_phase_b.py, stage1/tests/test_phase_b_patcher.py, stage1/utils/wording.py modified in stage1/.",
+      "Do-not-touch list intact: none of stage1/inference/runner.py, parser.py, evaluator.py, bds.py, loader.py, run_phase_a.py, run_phase_c.py, composer.py, stage2_confound.yaml, anchor_gate.py, manifest_parity.py, provenance.py, run_status.py appear in git diff --stat.",
+      "wording.py r2 delta is 0 (the r1 +11 -0 stands unchanged, confirmed via git diff --stat).",
+      "Test coverage: refactored test_no_human_continuation_in_clean_no_patch_smoke (L1026) uses real AutoTokenizer + real PROMPT_TEMPLATE; new test_eos_stop_on_im_end_only (L944) deliberately scalar-mismatches eos_token_id vs the emitted IM_END id and asserts the loop stops via stop_token_ids — would have caught r1 bug; new test_no_second_human_turn_in_no_patch_decode (L1166) defensive twin.",
+      "Reproducibility: phase_b_summary.json.environment has seed=42, torch_version=2.11.0+cu126, transformers_version=4.57.6, git_sha=3ebdef9..., cublas_workspace_config=:4096:8, deterministic_algorithms_enabled=true (verified by prior watcher and re-confirmed)."
+    ],
+    "missing": [],
+    "extra": [
+      "Two additive top-level summary keys (sanity_parity_status, sanity_parity_metrics). Per writer Open-item #3, these do not collide with any §11.1-§11.18 acceptance schema and are set to \"n/a (full mode)\" in full mode (run_phase_b.py L2148, L2280) so downstream tooling can rely on field presence."
+    ]
+  },
+  "checklist": {
+    "seed": "pass",
+    "determinism": "pass",
+    "device_dtype": "pass",
+    "loss_masking": "n/a (inference-only)",
+    "tokenizer_pinning": "pass",
+    "eval_path_purity": "pass",
+    "data_collator": "n/a",
+    "gradient_accumulation": "n/a",
+    "checkpoint_io": "n/a",
+    "metric_reduction": "pass",
+    "train_eval_leakage": "n/a (no train)",
+    "test_coverage": "pass"
+  },
+  "targeted_verifications": {
+    "A_root_cause_docs": "pass (per prior watcher partial; r2 handoff documents the runtime-probe-confirmed root cause: model emits 151643 first; HF generate honors generation_config.eos_token_id list; r1 manual loop only checked the scalar 151645 so missed the stop)",
+    "B_stop_token_set_completeness": "pass (patcher.py L825-857: union of tokenizer.eos_token_id [L827-829], model.generation_config.eos_token_id [L831-833], convert_tokens_to_ids(\"<|im_end|>\"|\"<|endoftext|>\") [L835-857] with unk_token_id and negative-id filters)",
+    "C_finished_mask_discipline": "pass (patcher.py L644-647 init, L654-659 top-of-loop break, L684-685 set finished, L687-701 hard-truncate at first stop inclusive; cache_position = prompt_len + step preserved at L665)",
+    "D_sanity_mode_gate": "pass (run_phase_b.py L496-559 helper with hard-fail thresholds Human:>1 / avg_len>1000 chars; L2280-2320 wiring on no_patch conditions only; L2298-2304 sets summary.failure_reason starting with `sanity P0 parity check failed: `; L2375-2389 preserves that reason over the generic prefix in the failed-branch persist; gate fires AFTER existing skipped-Human: check at L2263 and BEFORE cross-check at L2322)",
+    "E_sanity_artifacts": "pass (Human: counts: clean_no_patch=0/5, restoration_no_patch=0/5, patch_recovery_full=0/5 [FYI], corrupt_recovery_full=0/5 [FYI]; avg_lengths: clean_no_patch=499.2, restoration_no_patch=293.6 — match phase_b_summary.json sanity_parity_metrics exactly; conditional summary file in §7.2.4-skipped state with phase_b_conditional_summary.SKIPPED.txt present, as expected in sanity mode)",
+    "F_wording_gate_scope": "pass (git diff --stat stage1/utils/wording.py shows +11 -0 only — the r1 contribution unchanged; no r2 edit on wording.py)",
+    "G_files_to_touch_adherence": "pass (stage1 modified set = {patcher.py, run_phase_b.py, test_phase_b_patcher.py, wording.py} — exactly the writer's spec; codex-reviewer.md and notes/* deltas are outside stage1/ and not in the spec scope)",
+    "H_no_donot_touch_violation": "pass (none of the listed do-not-touch paths appear in git diff --stat)",
+    "I_reproducibility_audit": "pass (per prior watcher; environment block in phase_b_summary.json has seed=42, torch_version=2.11.0+cu126, transformers_version=4.57.6, git_sha=3ebdef971675f5eb97b5a5a17e92820a6fda44f5, cublas_workspace_config=\":4096:8\", deterministic_algorithms_enabled=true; runtime_provenance + dataset.sha256 pin also present)"
+  },
+  "findings": [
+    {
+      "severity": "low",
+      "file": "stage1/outputs/phase_b/run_20260429_181526_288894/phase_b_summary.json",
+      "line": 181,
+      "category": "metric",
+      "claim": "restoration_no_patch avg_output_length_chars = 293.6 is significantly below the Stage 1 hard_swap_b8 anchor mean (697.9), a 0.42× ratio.",
+      "evidence": "JSONL probe of results_restoration_no_patch.jsonl: n=5, mean 293.6 chars. Per writer Open-question #2, this is well INSIDE spec §11.6 ≤ 1.25× upper bound but on the low side at n=5. Spec §11.6 lower-bound 0.75× warning fires only on patched conditions (not no-patch), so this is INFORMATIONAL only.",
+      "suggested_fix": "No fix required for this revision; flag for the operator's full-mode rerun: if restoration_no_patch length << 0.75× Stage 1 anchor reproduces at n=250, investigate as a separate length-floor diagnostic (the only stop IDs added are 151645 and 151643, exactly what HF generate uses, so over-stopping is structurally implausible)."
+    }
+  ],
+  "must_fix_before_merge": [],
+  "can_ship_with_followup": [
+    "Operator full-mode rerun of `python -m stage1.run_phase_b --config stage1/configs/stage2_confound.yaml` is required to exercise the spec §11.4 / §11.5 / §11.6 hard gates against the canonical Stage 1 anchor; sanity-mode result is a strong predictor but not a substitute (writer Open-item #1).",
+    "Watch restoration_no_patch length ratio in the full rerun — sanity smoke shows 0.42× of Stage 1 anchor; investigate only if the full run reproduces << 0.75× at n=250."
+  ],
+  "rationale": "r2 targets the exact runtime-probe-confirmed root cause: model emits 151643 (<|endoftext|>) first; HF generate honors model.generation_config.eos_token_id == [151645, 151643]; the r1 manual loop only checked the scalar 151645. r2's union-of-three-sources stop-token set, top-of-loop finished check, and hard-truncate-at-first-stop are bytewise-equivalent to HF generate. Sanity smoke shows 0/5 Human: continuations on both no-patch conditions and 499/294-char means — well inside the spec §11.6 1.25× cap of the Stage 1 anchors (676.7 / 697.9). The narrow fix is sufficient to expect spec §11.4 / §11.5 / §11.6 acceptance on the operator's full clean rerun."
+}

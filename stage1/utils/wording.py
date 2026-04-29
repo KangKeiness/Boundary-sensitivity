@@ -27,6 +27,7 @@ from typing import List, Optional, Sequence, Tuple
 
 # Canonical Phase B list. Order matters only for deterministic test iteration.
 FORBIDDEN_PHRASES_PHASE_B: Tuple[str, ...] = (
+    # --- existing entries (unchanged, do not reorder) ---
     "proves the mechanism",
     "proves mechanism",
     "causal proof",
@@ -36,6 +37,16 @@ FORBIDDEN_PHRASES_PHASE_B: Tuple[str, ...] = (
     "restoration effect",       # Phase C reserved — forbidden in Phase B
     "residual effect",          # Phase C reserved — forbidden in Phase B
     "restoration proportion",   # Phase C reserved — forbidden in Phase B
+    # --- new entries from brief §G (added by phase_b_revision §8.3) ---
+    "formal causal proof",
+    "formal mediation",
+    "causal mediation",
+    "we prove causality",
+    "restoration fully explains degradation",
+    "natural direct effect",
+    "natural indirect effect",
+    "NIE",
+    "NDE",
 )
 
 # Phase C list. Core Phase C vocabulary is intentionally NOT forbidden here.

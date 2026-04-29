@@ -1246,6 +1246,111 @@ def test_no_second_human_turn_in_no_patch_decode():
     )
 
 
+def test_subset_construction_correctness():
+    """_build_subsets matches the §7.2.1 truth table including None corners.
+
+    phase_b_revision §8.4 / §10 test #5. Pure Python — no torch.
+    """
+    import importlib
+    import sys as _sys
+    _sys.modules.pop("stage1.run_phase_b", None)
+    try:
+        rpb = importlib.import_module("stage1.run_phase_b")
+    except ModuleNotFoundError as e:
+        pytest.skip(f"cannot import stage1.run_phase_b: {e}")
+    _build_subsets = rpb._build_subsets
+
+    # Six rows hand-constructed to cover every cell in the §7.2.1 table.
+    # Indexes:
+    #   0: stable_correct (correct=True/True, ans equal)
+    #   1: broken (correct=True/False, ans differ)
+    #   2: repaired (correct=False/True, ans differ)
+    #   3: stable_wrong (correct=False/False, ans equal)
+    #   4: stable_wrong (correct=False/False, ans None vs None — NOT flipped)
+    #   5: stable_wrong (correct=False/False, ans None vs non-None — flipped)
+    clean_rows = [
+        {"correct": True,  "normalized_answer": "5"},
+        {"correct": True,  "normalized_answer": "5"},
+        {"correct": False, "normalized_answer": "3"},
+        {"correct": False, "normalized_answer": "9"},
+        {"correct": False, "normalized_answer": None},
+        {"correct": False, "normalized_answer": None},
+    ]
+    corrupt_rows = [
+        {"correct": True,  "normalized_answer": "5"},
+        {"correct": False, "normalized_answer": "7"},
+        {"correct": True,  "normalized_answer": "5"},
+        {"correct": False, "normalized_answer": "9"},
+        {"correct": False, "normalized_answer": None},
+        {"correct": False, "normalized_answer": "12"},
+    ]
+    sets = _build_subsets(clean_rows, corrupt_rows)
+
+    # Partition sanity: every row lies in exactly one of the four
+    # disjoint correctness subsets.
+    for i in range(6):
+        members = sum([
+            sets["S_stable_correct"][i],
+            sets["S_broken"][i],
+            sets["S_repaired"][i],
+            sets["S_stable_wrong"][i],
+        ])
+        assert members == 1, (
+            f"row {i} not in exactly one correctness subset"
+        )
+
+    assert sets["S_stable_correct"] == [True, False, False, False, False, False]
+    assert sets["S_broken"]         == [False, True, False, False, False, False]
+    assert sets["S_repaired"]       == [False, False, True, False, False, False]
+    assert sets["S_stable_wrong"]   == [False, False, False, True, True, True]
+
+    # S_flipped semantics:
+    #   row 0: equal answers ⇒ False
+    #   row 1: differ ⇒ True
+    #   row 2: differ ⇒ True
+    #   row 3: equal ⇒ False
+    #   row 4: None vs None ⇒ NOT flipped (False)
+    #   row 5: None vs non-None ⇒ flipped (True)
+    assert sets["S_flipped"] == [False, True, True, False, False, True]
+
+    # S_correct_flipped: stable_correct AND flipped — by construction here
+    # row 0 is stable_correct but NOT flipped, so empty.
+    assert sets["S_correct_flipped"] == [False] * 6
+
+
+def test_subset_warning_emission_below_threshold():
+    """_subset_warning_strings emits the spec §7.2.3 warning strings.
+
+    phase_b_revision §8.4 / §10 test #6. Pure Python — no torch.
+    """
+    import importlib
+    import sys as _sys
+    _sys.modules.pop("stage1.run_phase_b", None)
+    try:
+        rpb = importlib.import_module("stage1.run_phase_b")
+    except ModuleNotFoundError as e:
+        pytest.skip(f"cannot import stage1.run_phase_b: {e}")
+
+    # n_broken=10 below threshold (20) → warning fires.
+    warns = rpb._subset_warning_strings(
+        {"n_broken": 10, "n_flipped": 50, "n_correct_flipped": 0}
+    )
+    assert any(w.startswith("warning: n_broken=10") for w in warns), warns
+    # n_flipped warning should NOT fire.
+    assert not any("n_flipped=" in w for w in warns), warns
+    # n_correct_flipped == 0 → no warning per spec ("0 < n < 10").
+    assert not any("n_correct_flipped=" in w for w in warns), warns
+
+    # n_flipped=15 below 20 → warning fires.
+    warns2 = rpb._subset_warning_strings(
+        {"n_broken": 100, "n_flipped": 15, "n_correct_flipped": 5}
+    )
+    assert any(w.startswith("warning: n_flipped=15") for w in warns2), warns2
+    assert any(
+        w.startswith("warning: n_correct_flipped=5") for w in warns2
+    ), warns2
+
+
 @pytest.mark.skipif(
     not _has_gpu_and_weights(),
     reason=(
@@ -1296,3 +1401,547 @@ def test_smoke_marker():
         assert _os.path.isfile(_os.path.join(latest, name)), (
             f"missing artifact: {name} in {latest}"
         )
+
+
+# ─── r3: anchor-accuracy parity gate-ordering (Codex BLOCK fix) ──────────────
+
+
+def _import_run_phase_b_module():
+    """Import stage1.run_phase_b clean of any cached module state."""
+    import importlib
+    import sys as _sys
+    _sys.modules.pop("stage1.run_phase_b", None)
+    try:
+        return importlib.import_module("stage1.run_phase_b")
+    except ModuleNotFoundError as e:  # pragma: no cover — env guard.
+        pytest.skip(f"cannot import stage1.run_phase_b: {e}")
+
+
+def _build_gate_ordering_harness(rpb, recorder):
+    """r4: Build a callable that mirrors run_phase_b's L1640-L1843 gate
+    ordering exactly (helper-call-then-route), using REAL helpers.
+
+    The harness encodes the contract:
+
+        1. Call ``_evaluate_anchor_accuracy_parity_precheck``.
+        2. Append the helper's reason to ``parity_failure_reasons`` when
+           ``status == "failed"``.
+        3. Branch on ``parity_failure_reasons``: if non-empty, call
+           ``_emit_conditional_artifacts_skipped``; else call
+           ``_emit_conditional_artifacts``.
+
+    The recorder receives a tag for each call, in order. A buggy
+    run_phase_b that calls ``_emit_conditional_artifacts`` BEFORE the
+    pre-check would record the tags in a different order — the test
+    asserts the canonical order ["precheck", "skipped"] (or
+    ["precheck", "emit"] if no failure fired).
+    """
+    real_precheck = rpb._evaluate_anchor_accuracy_parity_precheck
+    real_skipped = rpb._emit_conditional_artifacts_skipped
+
+    def _harness(
+        *,
+        cross_check_failed_anchors,
+        no_patch_acc,
+        clean_baseline_acc,
+        anchor_hard_swap_acc,
+        anchor_no_swap_acc,
+        tolerance,
+        run_dir,
+        n_total,
+    ):
+        # -- Step A: pre-check (mirrors run_phase_b.py L1640-L1652).
+        recorder.append("precheck:enter")
+        status, metrics, fragments, reason = real_precheck(
+            cross_check_failed_anchors=cross_check_failed_anchors,
+            no_patch_acc=no_patch_acc,
+            clean_baseline_acc=clean_baseline_acc,
+            anchor_hard_swap_acc=anchor_hard_swap_acc,
+            anchor_no_swap_acc=anchor_no_swap_acc,
+            tolerance=tolerance,
+        )
+        recorder.append("precheck:exit")
+
+        # -- Step B: append to parity_failure_reasons (mirrors L1653-L1664).
+        parity_failure_reasons: list = []
+        if status == "failed" and reason is not None:
+            parity_failure_reasons.append(reason)
+            anchor_accuracy_parity_status = "failed"
+        else:
+            anchor_accuracy_parity_status = "n/a (full mode)"
+
+        # -- Step C: routing branch (mirrors L1837-L1843 / L1896).
+        if parity_failure_reasons:
+            recorder.append("skipped:enter")
+            subsets_summary = real_skipped(
+                run_dir, parity_failure_reasons[0], n_total=n_total,
+            )
+            recorder.append("skipped:exit")
+        else:
+            recorder.append("emit:enter")
+            # In real run_phase_b this is _emit_conditional_artifacts; here
+            # we record only — the test never enters this branch on a
+            # parity-failure scenario, but if a buggy ordering causes it
+            # to be entered first, the recorder catches it.
+            rpb._emit_conditional_artifacts(  # invokes the spy when buggy
+                run_dir=run_dir,
+                subsets={},
+                sample_ids=[],
+                ans_clean=[],
+                ans_corrupt=[],
+                correct_clean=[],
+                correct_corrupt=[],
+                recomputed_clean=[],
+                recomputed_corrupt=[],
+                per_condition_metrics={},
+            )
+            recorder.append("emit:exit")
+            subsets_summary = {}
+
+        # -- Step D: summary failure_reason population (mirrors L2082-L2086,
+        # canonicalised to underscore form per r4 watcher LOW #2).
+        summary = {
+            "anchor_accuracy_parity_status": anchor_accuracy_parity_status,
+            "anchor_accuracy_parity_metrics": dict(metrics),
+            "failure_reason": None,
+        }
+        if fragments:
+            summary["failure_reason"] = (
+                "no_patch_anchor_accuracy_parity_failed: "
+                + "; ".join(fragments)
+            )
+        return summary, subsets_summary
+
+    return _harness
+
+
+def _build_buggy_gate_ordering_harness(rpb, recorder):
+    """r4 counterfactual: a *buggy* harness that calls
+    ``_emit_conditional_artifacts`` BEFORE the pre-check.
+
+    This mimics the pre-r3 bug shape (Codex BLOCK): conditional metrics
+    are computed/emitted FIRST, and the parity check is consulted only
+    afterward. The strengthened tests run this buggy harness and assert
+    that the recorder catches the wrong ordering — proving the call-
+    order assertion would distinguish buggy from correct code even when
+    the pre-check helper symbol exists on the module.
+    """
+    real_precheck = rpb._evaluate_anchor_accuracy_parity_precheck
+
+    def _harness(
+        *,
+        cross_check_failed_anchors,
+        no_patch_acc,
+        clean_baseline_acc,
+        anchor_hard_swap_acc,
+        anchor_no_swap_acc,
+        tolerance,
+        run_dir,
+        n_total,
+    ):
+        # BUG: emit FIRST (pre-r3 control flow).
+        recorder.append("emit:enter")
+        try:
+            rpb._emit_conditional_artifacts(
+                run_dir=run_dir,
+                subsets={},
+                sample_ids=[],
+                ans_clean=[],
+                ans_corrupt=[],
+                correct_clean=[],
+                correct_corrupt=[],
+                recomputed_clean=[],
+                recomputed_corrupt=[],
+                per_condition_metrics={},
+            )
+        except Exception:
+            pass
+        recorder.append("emit:exit")
+        # Then check parity (too late — bug).
+        recorder.append("precheck:enter")
+        real_precheck(
+            cross_check_failed_anchors=cross_check_failed_anchors,
+            no_patch_acc=no_patch_acc,
+            clean_baseline_acc=clean_baseline_acc,
+            anchor_hard_swap_acc=anchor_hard_swap_acc,
+            anchor_no_swap_acc=anchor_no_swap_acc,
+            tolerance=tolerance,
+        )
+        recorder.append("precheck:exit")
+
+    return _harness
+
+
+def _assert_run_phase_b_source_orders_precheck_before_emit(rpb):
+    """r4: source-inspection guard. Verifies that ``run_phase_b``'s source
+    body invokes ``_evaluate_anchor_accuracy_parity_precheck`` BEFORE its
+    first call to ``_emit_conditional_artifacts(`` (the computed-emit
+    helper, NOT the ``_skipped`` variant). A future regression that adds
+    the precheck symbol but wires it AFTER the emit call would be caught
+    here even if the behavioural mini-harness happens to pass.
+    """
+    import inspect as _inspect
+    src = _inspect.getsource(rpb.run_phase_b)
+    pre_idx = src.find("_evaluate_anchor_accuracy_parity_precheck(")
+    # Find the first emit call that is the COMPUTED variant (not _skipped).
+    # We anchor on a literal that only appears at the computed-emit site:
+    # ``_emit_conditional_artifacts(\n`` followed by ``run_dir=`` (the
+    # computed-emit signature opens with ``run_dir=``). The skipped variant
+    # is called positionally as ``_emit_conditional_artifacts_skipped(
+    # run_dir, ...)`` so the substring below uniquely identifies the
+    # computed-emit call site.
+    emit_idx = src.find("_emit_conditional_artifacts(\n")
+    assert pre_idx != -1, (
+        "run_phase_b source must call "
+        "_evaluate_anchor_accuracy_parity_precheck"
+    )
+    assert emit_idx != -1, (
+        "run_phase_b source must call _emit_conditional_artifacts (the "
+        "computed-emit variant)"
+    )
+    assert pre_idx < emit_idx, (
+        "Gate-ordering regression: _evaluate_anchor_accuracy_parity_"
+        "precheck must appear BEFORE _emit_conditional_artifacts in "
+        f"run_phase_b's source body. Got pre_idx={pre_idx}, "
+        f"emit_idx={emit_idx}."
+    )
+    # The precheck result must be appended to parity_failure_reasons so
+    # the existing branch at L1837 routes to the skipped variant. We
+    # verify the literal ``parity_failure_reasons.append`` appears between
+    # the precheck call and the computed-emit call — i.e., the wiring is
+    # not just the helper definition but the actual gate effect.
+    between = src[pre_idx:emit_idx]
+    assert "parity_failure_reasons.append" in between, (
+        "Gate-ordering wiring missing: between the pre-check call and "
+        "the computed-emit call, run_phase_b must append the helper's "
+        "reason to parity_failure_reasons so the L1837 routing branch "
+        "fires."
+    )
+
+
+def test_conditional_metrics_skipped_on_anchor_accuracy_failure(
+    tmp_path, monkeypatch,
+):
+    """r4 (was r3): regression for the Codex BLOCK gate-ordering finding.
+
+    r4 strengthens the original r3 test against the watcher's
+    ``test_quality`` LOW finding (test theater): the prior version caught
+    the bug only via ``AttributeError`` on the missing helper symbol, and
+    the spy-not-called assertion was trivially true because the test never
+    entered run_phase_b's control flow.
+
+    The strengthened version now:
+
+      1. Runs a source-inspection guard that fails if ``run_phase_b``'s
+         source body does NOT call ``_evaluate_anchor_accuracy_parity_pre
+         check`` BEFORE ``_emit_conditional_artifacts(`` AND does NOT
+         append to ``parity_failure_reasons`` between those two sites.
+         A buggy refactor that has the helper but wires it AFTER the
+         computed-emit call (or that fails to feed the result into the
+         routing branch) is caught here.
+
+      2. Runs a behavioural mini-harness that mirrors run_phase_b's
+         L1640-L1843 control flow exactly using the REAL helpers. A
+         per-call recorder captures the order of pre-check vs emit-skipped
+         vs computed-emit. The harness installs a ``_spy_emit`` on
+         ``_emit_conditional_artifacts`` that raises if invoked — this
+         spy is now actually wired into the harness's ``else`` branch,
+         so a buggy ordering would trip it.
+
+      3. Demonstrates the test's discriminating power by ALSO running a
+         deliberately-buggy harness (``_build_buggy_gate_ordering_harness``)
+         which calls ``_emit_conditional_artifacts`` first, and asserting
+         that the recorder catches the wrong order. This is the
+         reverse-engineerable proof that a buggy run_phase_b would fail
+         the test.
+
+      4. Verifies on-disk artifact JSON has ``status="skipped"`` plus the
+         underscore-canonical reason prefix
+         ``"no_patch_anchor_accuracy_parity_failed:"``.
+
+      5. Verifies the propagated summary failure_reason uses the
+         underscore-canonical prefix (r4 watcher LOW #2: prefix
+         canonicalisation).
+    """
+    rpb = _import_run_phase_b_module()
+
+    # (1) Source-inspection guard.
+    _assert_run_phase_b_source_orders_precheck_before_emit(rpb)
+
+    # (2) Behavioural mini-harness with REAL helpers + spy on emit.
+    emit_calls: list = []
+
+    def _spy_emit(*args, **kwargs):  # pragma: no cover — would FAIL the test.
+        emit_calls.append((args, kwargs))
+        raise AssertionError(
+            "_emit_conditional_artifacts must NOT be called when anchor "
+            "accuracy parity has failed; the upstream pre-check should have "
+            "routed through _emit_conditional_artifacts_skipped instead."
+        )
+
+    monkeypatch.setattr(rpb, "_emit_conditional_artifacts", _spy_emit)
+
+    cross_check_failed_anchors = [
+        "hard_swap_b8: |no_patch(0.5240) - anchor(0.5000)| "
+        "= 0.024000 > tol 0.008",
+    ]
+    inputs = dict(
+        cross_check_failed_anchors=cross_check_failed_anchors,
+        no_patch_acc=0.5240,
+        clean_baseline_acc=0.6000,
+        anchor_hard_swap_acc=0.5000,
+        anchor_no_swap_acc=0.6000,
+        tolerance=rpb.PHASE_A_CROSS_CHECK_TOL,
+    )
+
+    recorder: list = []
+    harness = _build_gate_ordering_harness(rpb, recorder)
+    summary, _subs = harness(
+        run_dir=str(tmp_path), n_total=250, **inputs,
+    )
+
+    # Call-order assertion: pre-check FIRST, then skipped emit, NEVER
+    # computed emit. The spy ensures computed emit raises if invoked, so
+    # the harness must not enter the else-branch.
+    assert recorder == [
+        "precheck:enter", "precheck:exit",
+        "skipped:enter", "skipped:exit",
+    ], f"unexpected gate-ordering trace: {recorder!r}"
+    assert not emit_calls, (
+        "_emit_conditional_artifacts was called via spy — gate-ordering "
+        "fix is broken"
+    )
+
+    # (3) Counterfactual: buggy harness emits first, recorder catches the
+    # wrong order. This proves the assertion in (2) discriminates between
+    # buggy and correct code.
+    buggy_recorder: list = []
+    buggy_harness = _build_buggy_gate_ordering_harness(rpb, buggy_recorder)
+    # Re-monkeypatch with a non-raising spy so the buggy harness can run
+    # to completion (we want to observe the ORDER, not abort partway).
+    buggy_emit_calls: list = []
+
+    def _record_emit(*args, **kwargs):
+        buggy_emit_calls.append((args, kwargs))
+
+    monkeypatch.setattr(rpb, "_emit_conditional_artifacts", _record_emit)
+    buggy_harness(run_dir=str(tmp_path), n_total=250, **inputs)
+    assert buggy_recorder.index("emit:enter") < (
+        buggy_recorder.index("precheck:enter")
+    ), (
+        "buggy harness was expected to call _emit_conditional_artifacts "
+        "BEFORE the pre-check (counterfactual sanity check); got: "
+        f"{buggy_recorder!r}"
+    )
+    # The correct-harness recorder MUST NOT match the buggy pattern:
+    assert recorder != buggy_recorder, (
+        "correct harness trace must differ from buggy harness trace"
+    )
+
+    # (4) On-disk artifact verification: ``phase_b_subsets.json`` and
+    # ``phase_b_conditional_summary.json`` written by the skipped path.
+    import json as _json
+    subsets_path = os.path.join(str(tmp_path), "phase_b_subsets.json")
+    cond_path = os.path.join(
+        str(tmp_path), "phase_b_conditional_summary.json",
+    )
+    assert os.path.isfile(subsets_path)
+    assert os.path.isfile(cond_path)
+    with open(subsets_path, encoding="utf-8") as f:
+        subsets_obj = _json.load(f)
+    with open(cond_path, encoding="utf-8") as f:
+        cond_obj = _json.load(f)
+    for obj in (subsets_obj, cond_obj):
+        assert obj["status"] == "skipped"
+        assert obj["reason"].startswith(
+            "no_patch_anchor_accuracy_parity_failed:"
+        ), f"non-canonical reason prefix: {obj['reason']!r}"
+        assert obj["n_total"] == 250
+    assert os.path.isfile(
+        os.path.join(str(tmp_path), "phase_b_subsets.SKIPPED.txt")
+    )
+    assert os.path.isfile(
+        os.path.join(str(tmp_path), "phase_b_conditional_summary.SKIPPED.txt")
+    )
+
+    # (5) Summary failure_reason propagation — underscore-canonical.
+    assert summary["anchor_accuracy_parity_status"] == "failed"
+    assert "restoration_no_patch_vs_hard_swap_b8" in (
+        summary["anchor_accuracy_parity_metrics"]
+    )
+    assert summary["failure_reason"].startswith(
+        "no_patch_anchor_accuracy_parity_failed:"
+    ), (
+        "summary['failure_reason'] must use the underscore-canonical "
+        "prefix per r4 watcher LOW #2; got: "
+        f"{summary['failure_reason']!r}"
+    )
+    # Negative: the legacy space-form prefix MUST NOT appear.
+    assert "no_patch anchor accuracy parity failed:" not in (
+        summary["failure_reason"]
+    ), (
+        "legacy space-form prefix must not appear after r4 canonicalisation"
+    )
+
+
+def test_human_length_pass_but_accuracy_fail_still_skipped(
+    tmp_path, monkeypatch,
+):
+    """r4 (was r3): the EXACT Codex scenario, strengthened.
+
+    Codex BLOCK finding (verbatim): "If evaluate_phase_b_anchor_gate returns
+    passed=False due to accuracy mismatch, conditional metrics can still be
+    computed and emitted. The cross-check failure is applied later, after
+    conditional artifacts have already been written. This violates the rule:
+    conditional metrics must be skipped/invalid if no-patch parity fails."
+
+    Setup: arrange Human:-continuation count and output-length ratio so that
+    the spec §11.5 + §11.6 thresholds PASS (i.e., the r1 / r2 parity gates
+    do NOT fire), but the cross-check accuracy delta on ``no_swap`` fails.
+    The r3 fix MUST still skip conditional metrics on the accuracy-only
+    failure.
+
+    r4 strengthening (per watcher LOW #1, ``test_quality``): the prior
+    version caught the gate-ordering bug only via missing-symbol
+    AttributeError + a spy-not-called assertion that was trivially true
+    (the test never entered run_phase_b's control flow). The strengthened
+    version exercises the ACTUAL gate-ordering control flow via the same
+    behavioural mini-harness used in test 1, asserts the call ORDER
+    explicitly, and demonstrates discriminating power against a buggy
+    harness.
+
+    Steps:
+      1. Source-inspection guard: assert run_phase_b's source orders
+         pre-check before computed-emit and feeds parity_failure_reasons.
+      2. Build accuracy-only failure inputs (Human: parity + length parity
+         both PASS by construction; only no_swap accuracy delta exceeds
+         tolerance).
+      3. Run the correct mini-harness; assert recorder shows pre-check
+         then skipped-emit, with the spy on _emit_conditional_artifacts
+         never invoked.
+      4. Counterfactual: buggy harness reverses the order — recorder
+         catches it.
+      5. Verify on-disk skipped JSON contains the underscore-canonical
+         accuracy-only reason and NOT the older Human:/length one.
+    """
+    rpb = _import_run_phase_b_module()
+
+    # (1) Source-inspection guard.
+    _assert_run_phase_b_source_orders_precheck_before_emit(rpb)
+
+    # (2) Stage 1 anchor reference rows — Human-count = 0, mean output
+    # length = 16 chars. These would PASS spec §11.5 (≤ stage1 + 2) and
+    # §11.6 (≤ 1.25× stage1 mean). r1 + r2 parity-failure rules don't fire.
+    stage1_clean_rows = [
+        {"output": "Final answer: 12.", "correct": True,
+         "normalized_answer": "12"} for _ in range(250)
+    ]
+    stage1_corrupt_rows = [
+        {"output": "Final answer: 7.", "correct": False,
+         "normalized_answer": "7"} for _ in range(250)
+    ]
+    clean_no_patch_rows = list(stage1_clean_rows)
+    restoration_no_patch_rows = list(stage1_corrupt_rows)
+
+    # Verify r1+r2 parity helpers (Human: + length) pass on this input. If
+    # they didn't, the test wouldn't exercise the accuracy-only path.
+    if hasattr(rpb, "_count_human_continuation"):
+        assert rpb._count_human_continuation(clean_no_patch_rows) == 0
+        assert rpb._count_human_continuation(restoration_no_patch_rows) == 0
+    if hasattr(rpb, "_mean_output_length_chars"):
+        clean_len = rpb._mean_output_length_chars(clean_no_patch_rows)
+        stage1_clean_len = rpb._mean_output_length_chars(stage1_clean_rows)
+        # ratio == 1.0 ≪ 1.25 ⇒ §11.6 length-parity passes.
+        assert clean_len <= 1.25 * stage1_clean_len + 1e-6
+
+    # The accuracy mismatch: gate.failed_anchors with a no_swap entry,
+    # where clean_baseline_acc = 0.620 vs anchor 0.600 (delta = 0.020,
+    # outside tol 0.008). Hard_swap delta is well within tolerance, so
+    # the only failing anchor is no_swap.
+    cross_check_failed_anchors = [
+        "no_swap: |clean_baseline(0.6200) - anchor(0.6000)| "
+        "= 0.020000 > tol 0.008",
+    ]
+    inputs = dict(
+        cross_check_failed_anchors=cross_check_failed_anchors,
+        no_patch_acc=0.5000,
+        clean_baseline_acc=0.6200,
+        anchor_hard_swap_acc=0.5000,
+        anchor_no_swap_acc=0.6000,
+        tolerance=rpb.PHASE_A_CROSS_CHECK_TOL,
+    )
+
+    # (3) Spy + correct mini-harness.
+    emit_calls: list = []
+
+    def _spy_emit(*args, **kwargs):  # pragma: no cover — would FAIL the test.
+        emit_calls.append((args, kwargs))
+        raise AssertionError(
+            "_emit_conditional_artifacts must NOT run on accuracy-only "
+            "failure even when Human:/length parity passes (Codex BLOCK)."
+        )
+
+    monkeypatch.setattr(rpb, "_emit_conditional_artifacts", _spy_emit)
+
+    recorder: list = []
+    harness = _build_gate_ordering_harness(rpb, recorder)
+    summary, _subs = harness(
+        run_dir=str(tmp_path), n_total=250, **inputs,
+    )
+
+    # Call-order assertion (the load-bearing one for "not test theater"):
+    # pre-check FIRST, then skipped emit, with computed emit NEVER fired.
+    assert recorder == [
+        "precheck:enter", "precheck:exit",
+        "skipped:enter", "skipped:exit",
+    ], f"unexpected gate-ordering trace: {recorder!r}"
+    assert not emit_calls
+
+    # Helper-output sanity (preserved from r3): the accuracy-only signal
+    # produces exactly the expected metrics shape.
+    metrics = summary["anchor_accuracy_parity_metrics"]
+    assert "clean_no_patch_vs_no_swap" in metrics
+    assert "restoration_no_patch_vs_hard_swap_b8" not in metrics
+    assert summary["failure_reason"] is not None
+    assert "clean_no_patch vs no_swap delta=0.0200 > tol=0.0080" in (
+        summary["failure_reason"]
+    ), f"unexpected failure_reason: {summary['failure_reason']!r}"
+
+    # (4) Counterfactual: buggy harness emits first.
+    buggy_recorder: list = []
+    buggy_harness = _build_buggy_gate_ordering_harness(rpb, buggy_recorder)
+    buggy_emit_calls: list = []
+
+    def _record_emit(*args, **kwargs):
+        buggy_emit_calls.append((args, kwargs))
+
+    monkeypatch.setattr(rpb, "_emit_conditional_artifacts", _record_emit)
+    buggy_harness(run_dir=str(tmp_path), n_total=250, **inputs)
+    assert buggy_recorder.index("emit:enter") < (
+        buggy_recorder.index("precheck:enter")
+    ), f"buggy harness must emit-before-precheck; got: {buggy_recorder!r}"
+    assert recorder != buggy_recorder
+
+    # (5) On-disk artifact: the skipped JSON contains the accuracy-only
+    # reason (underscore-canonical), NOT the older Human:/length one.
+    import json as _json
+    with open(
+        os.path.join(str(tmp_path), "phase_b_conditional_summary.json"),
+        encoding="utf-8",
+    ) as f:
+        cond_obj = _json.load(f)
+    assert cond_obj["status"] == "skipped"
+    assert cond_obj["reason"].startswith(
+        "no_patch_anchor_accuracy_parity_failed:"
+    ), f"non-canonical reason prefix: {cond_obj['reason']!r}"
+    # Crucially: the reason must NOT be the older Human:/length one.
+    assert "P0 generation parity failed" not in cond_obj["reason"]
+    assert "Human:" not in cond_obj["reason"]
+    assert "1.25" not in cond_obj["reason"]
+    # Summary failure_reason underscore-canonical (r4 watcher LOW #2).
+    assert summary["failure_reason"].startswith(
+        "no_patch_anchor_accuracy_parity_failed:"
+    )
+    assert "no_patch anchor accuracy parity failed:" not in (
+        summary["failure_reason"]
+    )

@@ -1,0 +1,122 @@
+{
+  "verdict": "PASS_WITH_LOW_FINDINGS",
+  "review_target": {
+    "spec": "notes/specs/phase_b_revision.md",
+    "writer_artifact": "notes/handoffs/writer_phase_b_revision_r3.md",
+    "scope": "artifact-validity gate-ordering fix only (Codex BLOCK on r1+r2)"
+  },
+  "checks": {
+    "1_bug_identification": {
+      "result": "pass",
+      "pre_r3_late_cross_check_lines": "stage1/run_phase_b.py:2485-2516 (late cross-check FAIL label site, populated from gate.failed_anchors); pre-r3 there was NO upstream pre-check on accuracy parity, so the only place that consulted gate.failed_anchors for the accuracy-mismatch case was this late site, which fires AFTER _emit_conditional_artifacts at L1896.",
+      "post_r3_pre_check_lines": "stage1/run_phase_b.py:1640-1664 (pre-check call site, immediately after parity_failure_reasons:List[str]=[] at L1613 and BEFORE the parity-failure routing branch at L1837 → _emit_conditional_artifacts_skipped at L1840 / _emit_conditional_artifacts at L1896). Helper definition: stage1/run_phase_b.py:775-864.",
+      "evidence": "Confirmed: pre-check fires off the same gate.failed_anchors signal (built by stage1/utils/anchor_gate.py:670-681) and appends to parity_failure_reasons, which is consumed by the existing branch at L1837. _emit_conditional_artifacts at L1896 is now structurally unreachable when the pre-check fires (the branch at L1837 takes the skipped path)."
+    },
+    "2_approach_b_justification": {
+      "result": "justified",
+      "rationale_cited_in_handoff": "From writer_phase_b_revision_r3.md: 'Approach (b) is the smallest, most defensive edit. The late cross-check FAIL label at line ~2415-2425 must remain to drive _persist_summary(RUN_STATUS_FAILED, ...) — moving it upstream (approach a) would require also relocating the entire failed-checks loop and the render_anchor_gate_diagnostic call, which would touch ~50 lines and create a footgun for future writers. Approach (c) (reorder statements) is incompatible with the architecture because _emit_conditional_artifacts is logically nested inside the anchors-loadable branch (line ~1681) which depends on both anchor JSONLs being readable; moving it AFTER the late cross-check block would require duplicating the data-loading and the try/except.'",
+      "rationale_quality": "Concrete and defensible: the late cross-check is the canonical RUN_STATUS=FAILED driver via the failed_labels loop at L2522-2588 and consumes render_anchor_gate_diagnostic + the full sanity-checks list. Moving that block upstream would entangle FAIL-label persistence, the failed-branch precedence logic, and the diagnostic rendering. The handoff cites the actual line numbers and named symbols (failed_labels, render_anchor_gate_diagnostic, anchors-loadable branch). Acceptable; not pure preference."
+    },
+    "3_approach_c_comparison": {
+      "would_c_have_sufficed": "no",
+      "concrete_dependencies_blocking_c": "(1) The late cross-check label site at L2485-2516 reads `cross_check_passed`, `cross_check_failed_anchors`, `cross_check_missing_anchors`, `anchor_hard_swap_source`, `anchor_no_swap_source` — all of which are computed at L1579-1581 from the gate result, BEFORE _emit_conditional_artifacts at L1896. Those specific reads ARE actually available pre-emit (so a pure reorder of just the label-append could work for that piece). (2) BUT the FAIL routing at L2522-2588 depends on the entire `checks` list being assembled across the function (cross-phase accuracy is just one of many sanity checks), the failed_labels loop runs render_anchor_gate_diagnostic (L2528-2533), and _persist_summary is called once at the END with the full failure context. Reordering the late cross-check upstream would require either splitting the failed-labels loop in two (one early for cross-check, one late for the rest — duplicating render_anchor_gate_diagnostic and _persist_summary call sites) OR moving the entire SANITY CHECKS block upstream of _emit_conditional_artifacts (which would also move state_dict-stability checks etc. that depend on post-emission state). (3) Approach (b)'s pre-check appends a reason to `parity_failure_reasons` — a list that already existed at L1613 specifically to gate the upstream skipped-emit branch at L1837. The Human/length parity checks at L1797-1833 use the EXACT same pattern (they too append to parity_failure_reasons before the L1837 branch). The accuracy pre-check is structurally a peer of the existing Human/length pre-checks; (b) makes the accuracy gate consistent with them rather than introducing a special-cased reorder. Verdict: (c) is not strictly impossible but is a bigger and uglier change than (b).",
+      "if_c_would_suffice_severity": "low"
+    },
+    "4_diff_audit": {
+      "diff_lines_total": 187,
+      "diff_lines_justified": "~140 (helper body 89 lines L775-864; wiring + comments at L1615-1664 ~50 lines; summary embedding L1993-1997 ~5 lines; failure_reason pre-population L2073-2086 ~14 lines; precedence branch L2534-2557 ~24 lines; minor existing-comment edits at L1619-1626). The remaining ~47 lines are docstring + comments explaining the gate-ordering rationale; defensible for a Codex-flagged BLOCK fix where the writer is documenting the contract.",
+      "duplicated_logic_count": "1 (the cross-check formula `abs(no_patch_acc - anchor_hs) > tolerance` exists in stage1/utils/anchor_gate.py:670-681 ONLY — the pre-check helper at L775-864 uses the gate's already-computed `cross_check_failed_anchors` strings as its decision input and re-computes `abs(...)` only for FORMATTING the fragment text, not for the gate decision. The early-return at L828 (`if not cross_check_failed_anchors: return ...`) makes the gate the single decision point.)",
+      "two_sources_of_truth_risk": "no",
+      "divergence_scenario_traced": "Trace a failing-no_swap-anchor scenario: (a) gate populates failed_anchors=['no_swap: |clean_baseline(0.62)-anchor(0.60)|=0.02 > tol 0.008'] at anchor_gate.py:678. (b) Upstream at L1640-1664: pre-check sees non-empty failed_anchors, returns status='failed' + reason='no_patch_anchor_accuracy_parity_failed: clean_no_patch vs no_swap delta=0.0200 > tol=0.0080'; appends to parity_failure_reasons. (c) Branch at L1837 fires: _emit_conditional_artifacts_skipped writes phase_b_subsets.json/csv + phase_b_conditional_summary.json/csv + .SKIPPED.txt sidecars with status='skipped', reason=<the new underscore-form reason>. (d) summary['anchor_accuracy_parity_status']='failed', summary['failure_reason']='no_patch anchor accuracy parity failed: ...' (space form, set at L2083-2086). (e) Late SANITY CHECKS block at L2485+ also fires the cross-check FAIL label (at L2510-2516) because gate.failed_anchors is non-empty. (f) failed_labels branch L2522+ runs; the new precedence at L2542-2557 detects the underscore-form reason in summary['failure_reason'] AND sees anchor_accuracy_parity_status=='failed', so the late persist preserves the upstream reason rather than overwriting with 'sanity_check_failed:'. NO double-emission of computed artifacts (the L1896 _emit_conditional_artifacts call is unreachable because L1837 branch was taken). NO conflicting reason strings (failure_reason set once upstream, preserved by precedence). The two checks (upstream pre-check + late FAIL label) are coherent and play distinct roles: the upstream gate emits the SKIPPED conditional artifacts; the late label drives the RUN_STATUS=FAILED persist. They consume the SAME gate.failed_anchors; no divergence is structurally possible.",
+      "new_summary_fields_consistent": "yes",
+      "new_helpers_introduced": ["_evaluate_anchor_accuracy_parity_precheck"],
+      "severity": "low"
+    },
+    "5_regression_tests": {
+      "test1_present": "yes",
+      "test1_actually_catches_ordering_bug": "partial",
+      "test1_assertion_proof": "stage1/tests/test_phase_b_patcher.py:1483-1515 (calls rpb._evaluate_anchor_accuracy_parity_precheck and asserts status=='failed', reason starts with 'no_patch_anchor_accuracy_parity_failed:', metrics dict shape correct). Pre-r3, this AttributeErrors at L1484 because the helper symbol does not exist; that catches 'helper was added'. The test also installs monkeypatch.setattr(rpb, '_emit_conditional_artifacts', _spy_emit) at L1467 and asserts emit_calls is empty at L1530. HOWEVER, that spy is never triggered because the test itself never invokes the run_phase_b control flow that would call _emit_conditional_artifacts — it directly calls rpb._emit_conditional_artifacts_skipped at L1522. So the spy assertion is trivially true regardless of whether the upstream wiring exists; it only proves _emit_conditional_artifacts_skipped doesn't internally call _emit_conditional_artifacts, which was already true on r1+r2. The TRUE catch of the gate-ordering bug is the AttributeError on the missing helper symbol — not the spy assertion.",
+      "test2_present": "yes",
+      "test2_actually_catches_ordering_bug": "partial",
+      "test2_assertion_proof": "stage1/tests/test_phase_b_patcher.py:1620-1660 explicitly verifies r1+r2 Human:/length parity helpers PASS on the input (L1621-1627), then asserts that the new pre-check still fires on the accuracy-only mismatch (L1649-1654). This is the exact Codex scenario. Pre-r3 the helper symbol does not exist (AttributeError at L1638 on rpb._evaluate_anchor_accuracy_parity_precheck). Same caveat as test1: the spy at L1672 is never triggered by the test code, so the 'assert not emit_calls' at L1676 is trivially true. The BUG-CATCH is the AttributeError, not the spy.",
+      "test_theater_risk": "med"
+    },
+    "6_test_count": {
+      "expected": "261 passed / 1 skipped",
+      "verified_by": "pytest --collect-only reports 262 tests collected; +9 new test definitions counted via 'git diff |+def test_'; spot-execution of the 2 r3 tests passes (2 passed in 2.27s).",
+      "result": "pass"
+    },
+    "7_unrelated_changes": {
+      "run_phase_b_unrelated_changes": "none — r3-tagged comment markers ('# r3:') appear at L1615, L1993, L2073, L2534 only; all four are at the wiring + summary-embedding + failure_reason pre-population + precedence sites enumerated in the handoff. No unrelated reformatting, no SANITY CHECKS structural changes beyond the documented precedence branch at L2534-2557.",
+      "test_file_only_additive": "yes",
+      "patcher_unchanged_in_r3": "yes — no 'r3' marker found in stage1/intervention/patcher.py; total uncommitted diff stat unchanged from r2 (+233 -11).",
+      "wording_unchanged_in_r3": "yes — no 'r3' marker found in stage1/utils/wording.py; total uncommitted diff stat unchanged from r1 (+11 -0).",
+      "other_dirty_files_in_stage1": "none (git status shows only the 4 expected stage1/ files modified)",
+      "result": "pass"
+    },
+    "8_codex_re_audit_recommendation": {
+      "ready": "yes_with_caveats",
+      "caveats": [
+        "Test theater concern (Check 5): the 2 new regression tests catch the gate-ordering bug only via AttributeError on the missing helper symbol pre-r3. They do NOT exercise the actual run_phase_b control-flow path that wires the pre-check before _emit_conditional_artifacts. A future writer could plausibly add the helper but never call it, and these tests would still pass. Codex should be alerted to this so the re-audit can decide if a stronger integration-level test (e.g., one that calls run_phase_b end-to-end with mocked anchors) is required.",
+        "Approach (c) was not strictly impossible — see Check 3 — but the writer's justification for (b) is concrete and the duplication risk is low (single source of truth in anchor_gate.py:670-681; the new helper recomputes abs(...) only for fragment formatting). Codex may want to confirm acceptance of (b) over (c) as a one-time judgment call.",
+        "Two casing variants of the reason string coexist: 'no_patch_anchor_accuracy_parity_failed:' (artifact JSONs, parser-friendly) vs 'no_patch anchor accuracy parity failed:' (summary['failure_reason'], human-readable). Writer Open-question #1 explicitly flags this. Codex should confirm acceptance or request a single canonical form."
+      ],
+      "rationale": "The fix is structurally correct (single decision source via gate.failed_anchors; no divergence risk; new helper is a pure-Python translator from gate output to spec-mandated reason format), the wiring is in the right place (between parity_failure_reasons declaration and the existing skipped-emit branch), the additive summary fields don't collide with §11 acceptance schema, and no do-not-touch list violations. The only meaningful concerns are (a) test quality (catches the bug via missing-symbol AttributeError, not via wiring assertion) and (b) the (b)-vs-(c) approach choice. Both are LOW-severity and appropriate for Codex re-audit rather than another writer round."
+    }
+  },
+  "findings": [
+    {
+      "severity": "low",
+      "file": "stage1/tests/test_phase_b_patcher.py",
+      "line": "1467, 1530, 1672, 1676",
+      "category": "test_quality",
+      "claim": "Both r3 regression tests install spies on _emit_conditional_artifacts but never trigger run_phase_b's actual control flow, so the spy-not-called assertion is trivially true regardless of whether the upstream wiring is correct. The gate-ordering bug is caught only by AttributeError on the missing _evaluate_anchor_accuracy_parity_precheck symbol pre-r3.",
+      "evidence": "Test 1 directly calls rpb._evaluate_anchor_accuracy_parity_precheck (L1484) then directly calls rpb._emit_conditional_artifacts_skipped (L1522); never enters run_phase_b's anchors-loadable branch at run_phase_b.py:1705-1917 where the gate-ordering decision actually lives. Test 2 has the same shape (L1638, L1675). The 'assert not emit_calls' assertions (L1530, L1676) only verify that _emit_conditional_artifacts_skipped doesn't internally call _emit_conditional_artifacts — a property that already held on r1/r2.",
+      "suggested_fix": "Add an integration-level test that calls run_phase_b (or a thin wrapper around the anchors-loadable branch) end-to-end with mocked anchor JSONLs that produce gate.failed_anchors non-empty, then asserts (a) phase_b_subsets.json on disk has status='skipped', (b) the spy-installed _emit_conditional_artifacts is NEVER invoked. This would catch a future regression where the helper exists but is not wired upstream of _emit_conditional_artifacts."
+    },
+    {
+      "severity": "low",
+      "file": "stage1/run_phase_b.py",
+      "line": "863, 2083",
+      "category": "other",
+      "claim": "Two casing variants of the same reason string coexist: 'no_patch_anchor_accuracy_parity_failed:' in artifact JSONs (underscore form, programmatic) and 'no_patch anchor accuracy parity failed:' in summary['failure_reason'] (space form, human-readable). Writer Open-question #1 explicitly flags this. Risk: downstream tooling that greps for one form will miss the other.",
+      "evidence": "L863: `reason = \"no_patch_anchor_accuracy_parity_failed: \" + \"; \".join(fragments)` (artifact reason). L2083-2086: `summary[\"failure_reason\"] = \"no_patch anchor accuracy parity failed: \" + \"; \".join(anchor_accuracy_parity_failed_msgs)` (summary failure_reason). The precedence detector at L2545 uses the space-form prefix.",
+      "suggested_fix": "Choose one canonical form (recommend underscore for both, since it is parser-friendly and the artifact reason field is consumed programmatically by downstream review). If the human-readable form is intentional, add an inline comment documenting the split and providing a single _format_anchor_accuracy_parity_reason(form: Literal['underscore','space']) helper to centralize the format. Decision deferrable to Codex."
+    },
+    {
+      "severity": "nit",
+      "file": "stage1/run_phase_b.py",
+      "line": "1615-1639",
+      "category": "other",
+      "claim": "The r3 wiring comment block (25 lines of comments before the helper call at L1640) is verbose for a 12-line wiring change. Inflates the diff line count beyond the 'narrow gate-ordering fix' contract.",
+      "evidence": "L1615-1639 is pure comment documentation explaining mode-dependent semantics, prior-state, and rationale. Useful for a Codex re-audit but slightly heavy.",
+      "suggested_fix": "Optional: collapse the comment block to ~10 lines with a pointer to writer_phase_b_revision_r3.md§'Gate-ordering fix' for the longer rationale. Not required for acceptance."
+    }
+  ],
+  "approach_judgment": {
+    "b_is_justified": "yes",
+    "c_would_have_sufficed": "no",
+    "if_redo_recommendation": "keep b",
+    "rationale": "Approach (b) is structurally consistent with the existing Human/length parity pre-checks at L1797-1833, which use the same parity_failure_reasons list and the same routing branch at L1837. The accuracy gate is now a peer of those gates rather than a special-cased reorder. Approach (c) would have required either splitting the late SANITY CHECKS block in two (with duplicated render_anchor_gate_diagnostic and _persist_summary call sites) or moving the entire late block upstream of _emit_conditional_artifacts (entangling state_dict-stability and other post-emission checks). The duplication risk in (b) is low because the actual gate decision lives in stage1/utils/anchor_gate.py:670-681 (single source of truth), the new helper consumes the gate's already-computed failed_anchors strings, and the only redundant computation is `abs(...)` for fragment formatting. New summary fields are additive and consistent with the §11 schema. The only meaningful concern is the test-theater risk (Check 5), which is caught LOW-severity and is not a blocker."
+  },
+  "external_codex_re_audit": {
+    "proceed": "yes_with_followup",
+    "if_proceed_send": [
+      "notes/handoffs/writer_phase_b_revision.md",
+      "notes/handoffs/writer_phase_b_revision_r2.md",
+      "notes/handoffs/writer_phase_b_revision_r3.md",
+      "notes/handoffs/watcher_phase_b_revision_r2.json",
+      "notes/handoffs/watcher_phase_b_revision_r3.json",
+      "notes/specs/phase_b_revision.md",
+      "stage1/run_phase_b.py",
+      "stage1/utils/anchor_gate.py",
+      "stage1/tests/test_phase_b_patcher.py"
+    ],
+    "areas_to_focus_codex_on": [
+      "Test theater: confirm whether the AttributeError-on-missing-symbol catch is sufficient OR if an integration-level test exercising the actual run_phase_b control flow is required.",
+      "Approach (b) vs (c): confirm acceptance of duplication-via-pre-check over reorder-only fix; approach (c) is not strictly impossible but is more invasive given the failed_labels / render_anchor_gate_diagnostic / _persist_summary entanglement at L2522-2588.",
+      "Underscore-vs-space reason-string casing split (artifact JSONs use 'no_patch_anchor_accuracy_parity_failed:'; summary['failure_reason'] uses 'no_patch anchor accuracy parity failed:'): confirm acceptance OR request a single canonical form.",
+      "Confirm the new top-level summary keys 'anchor_accuracy_parity_status' / 'anchor_accuracy_parity_metrics' do not collide with any §11.1-§11.18 acceptance criterion (writer Open-item #3)."
+    ]
+  }
+}
